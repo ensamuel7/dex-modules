@@ -1,0 +1,196 @@
+import "str"
+
+external module c {
+    include "redis_shim.h"
+    pkg "hiredis"
+
+    type Context closed by "redisFree"
+    type Args closed by "redis_shim_args_free"
+    type Raw closed by "freeReplyObject"
+
+    fn connect(host: string, port: int): Context? = "redisConnect"
+    fn failed(ctx: Context): bool = "redis_shim_failed"
+    fn error(ctx: Context): string = "redis_shim_error"
+    fn argsNew(): Args? = "redis_shim_args_new"
+    fn argsPush(a: Args, s: string): void = "redis_shim_args_push"
+    fn call(ctx: Context, a: Args): Raw? = "redis_shim_args_call"
+    fn kind(r: Raw): int = "redis_shim_type"
+    fn integer(r: Raw): long = "redis_shim_integer"
+    fn str(r: Raw): string = "redis_shim_str"
+    fn count(r: Raw): int = "redis_shim_count"
+    fn itemKind(r: Raw, i: int): int = "redis_shim_item_type"
+    fn itemInteger(r: Raw, i: int): long = "redis_shim_item_integer"
+    fn itemStr(r: Raw, i: int): string = "redis_shim_item_str"
+}
+
+const STRING: int = 1
+const ARRAY: int = 2
+const INTEGER: int = 3
+const NIL: int = 4
+const STATUS: int = 5
+const ERROR: int = 6
+
+struct RedisError(message: string) {}
+
+enum Kind {
+    Text
+    Number
+    List
+    Nil
+    Status
+}
+
+struct Reply {
+    kind: Kind
+    text: string
+    number: long
+    items: string[]
+}
+
+struct Client {
+    ctx: Context
+
+    fn command(args: string[]): Reply throws RedisError {
+        let a: Args? = c.argsNew()
+        if (a == null) {
+            throw RedisError("out of memory")
+        }
+        foreach (args as arg) {
+            c.argsPush(a, arg)
+        }
+        let r: Raw? = c.call(self.ctx, a)
+        if (r == null) {
+            throw RedisError(c.error(self.ctx))
+        }
+        let k: int = c.kind(r)
+        if (k == ERROR) {
+            throw RedisError(c.str(r))
+        }
+        if (k == INTEGER) {
+            return Reply { kind: Kind.Number, text: "", number: c.integer(r), items: [] }
+        }
+        if (k == NIL) {
+            return Reply { kind: Kind.Nil, text: "", number: 0, items: [] }
+        }
+        if (k == STATUS) {
+            return Reply { kind: Kind.Status, text: c.str(r), number: 0, items: [] }
+        }
+        if (k == ARRAY) {
+            let items: string[] = []
+            let n: int = c.count(r)
+            for (let i: int = 0; i < n; i++) {
+                if (c.itemKind(r, i) == INTEGER) {
+                    items.push(str.fromLong(c.itemInteger(r, i)))
+                } else {
+                    items.push(c.itemStr(r, i))
+                }
+            }
+            return Reply { kind: Kind.List, text: "", number: 0, items: items }
+        }
+        return Reply { kind: Kind.Text, text: c.str(r), number: 0, items: [] }
+    }
+
+    fn ping(): string throws RedisError {
+        return self.command(["PING"]).text
+    }
+
+    fn set(key: string, value: string): void throws RedisError {
+        self.command(["SET", key, value])
+    }
+
+    fn setex(key: string, value: string, seconds: int): void throws RedisError {
+        self.command(["SET", key, value, "EX", str.fromInt(seconds)])
+    }
+
+    fn get(key: string): string? throws RedisError {
+        let r: Reply = self.command(["GET", key])
+        if (r.kind == Kind.Nil) {
+            return null
+        }
+        return r.text
+    }
+
+    fn del(key: string): long throws RedisError {
+        return self.command(["DEL", key]).number
+    }
+
+    fn exists(key: string): bool throws RedisError {
+        return self.command(["EXISTS", key]).number > 0
+    }
+
+    fn incr(key: string): long throws RedisError {
+        return self.command(["INCR", key]).number
+    }
+
+    fn incrBy(key: string, by: long): long throws RedisError {
+        return self.command(["INCRBY", key, str.fromLong(by)]).number
+    }
+
+    fn expire(key: string, seconds: int): bool throws RedisError {
+        return self.command(["EXPIRE", key, str.fromInt(seconds)]).number == 1
+    }
+
+    fn ttl(key: string): long throws RedisError {
+        return self.command(["TTL", key]).number
+    }
+
+    fn keys(pattern: string): string[] throws RedisError {
+        return self.command(["KEYS", pattern]).items
+    }
+
+    fn hset(key: string, field: string, value: string): long throws RedisError {
+        return self.command(["HSET", key, field, value]).number
+    }
+
+    fn hget(key: string, field: string): string? throws RedisError {
+        let r: Reply = self.command(["HGET", key, field])
+        if (r.kind == Kind.Nil) {
+            return null
+        }
+        return r.text
+    }
+
+    fn hgetall(key: string): map[string, string] throws RedisError {
+        let items: string[] = self.command(["HGETALL", key]).items
+        let out: map[string, string] = {}
+        for (let i: int = 0; i + 1 < items.len(); i += 2) {
+            out.set(items[i], items[i + 1])
+        }
+        return out
+    }
+
+    fn lpush(key: string, value: string): long throws RedisError {
+        return self.command(["LPUSH", key, value]).number
+    }
+
+    fn rpush(key: string, value: string): long throws RedisError {
+        return self.command(["RPUSH", key, value]).number
+    }
+
+    fn lrange(key: string, start: int, stop: int): string[] throws RedisError {
+        return self.command(["LRANGE", key, str.fromInt(start), str.fromInt(stop)]).items
+    }
+
+    fn sadd(key: string, member: string): long throws RedisError {
+        return self.command(["SADD", key, member]).number
+    }
+
+    fn smembers(key: string): string[] throws RedisError {
+        return self.command(["SMEMBERS", key]).items
+    }
+
+    fn publish(channel: string, message: string): long throws RedisError {
+        return self.command(["PUBLISH", channel, message]).number
+    }
+}
+
+fn connect(host: string, port: int): Client throws RedisError {
+    let ctx: Context? = c.connect(host, port)
+    if (ctx == null) {
+        throw RedisError("out of memory connecting to " + host)
+    }
+    if (c.failed(ctx)) {
+        throw RedisError(c.error(ctx))
+    }
+    return Client { ctx: ctx }
+}

@@ -1,0 +1,64 @@
+import "fmt"
+import "str"
+import "github.com/ensamuel7/dex-modules/sqlite"
+import "github.com/ensamuel7/dex-modules/redis"
+
+struct User {
+    id: long
+    name: string
+}
+
+fn loadUser(
+    db: sqlite.Database,
+    cache: redis.Client,
+    id: long
+): User? throws sqlite.SqliteError, redis.RedisError {
+    let key: string = "user:" + str.fromLong(id)
+    let cached: string? = cache.get(key)
+    if (cached != null) {
+        fmt.println("cache hit  " + key)
+        return User { id: id, name: cached }
+    }
+    let q: sqlite.Statement = db.prepare("SELECT name FROM users WHERE id = ?")
+    q.bindLong(1, id)
+    if (!q.next()) {
+        return null
+    }
+    let name: string = q.getText(0)
+    cache.setex(key, name, 60)
+    fmt.println("cache miss " + key)
+    return User { id: id, name: name }
+}
+
+fn run(): void throws sqlite.SqliteError, redis.RedisError {
+    let db: sqlite.Database = sqlite.open("example.db")
+    db.exec("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT)")
+    db.exec("DELETE FROM users")
+    let ins: sqlite.Statement = db.prepare("INSERT INTO users(name) VALUES (?)")
+    foreach (["ada", "grace", "linus"] as name) {
+        ins.bindText(1, name).run()
+        ins.reset()
+    }
+
+    let cache: redis.Client = redis.connect("127.0.0.1", 6379)
+    cache.del("user:2")
+    for (let pass: int = 0; pass < 2; pass++) {
+        let u: User? = loadUser(db, cache, 2)
+        if (u != null) {
+            fmt.println("  -> " + u.name)
+        }
+    }
+    fmt.println(
+        "sqlite " + sqlite.version() + ", " + str.fromInt(db.queryInt("SELECT count(*) FROM users")) + " users"
+    )
+}
+
+fn main(): void {
+    try {
+        run()
+    } catch (e: sqlite.SqliteError) {
+        fmt.println("database: " + e.message)
+    } catch (e: redis.RedisError) {
+        fmt.println("redis: " + e.message)
+    }
+}

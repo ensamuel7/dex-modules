@@ -1,0 +1,84 @@
+import "fmt"
+import "num"
+import "github.com/ensamuel7/dex-modules/sqlite"
+
+fn seeded(): sqlite.Database throws sqlite.SqliteError {
+    let db: sqlite.Database = sqlite.memory()
+    db.exec("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INT, score REAL)")
+    let ins: sqlite.Statement = db.prepare("INSERT INTO users(name, age, score) VALUES (?, ?, ?)")
+    let names: string[] = ["ada", "grace", "linus"]
+    for (let i: int = 0; i < names.len(); i++) {
+        ins.bindText(1, names[i]).bindInt(2, 30 + i).bindDouble(3, 1.5 * num.toDouble(i))
+        ins.run()
+        ins.reset()
+    }
+    return db
+}
+
+fn run(): void throws sqlite.SqliteError {
+    assert(sqlite.version().len() > 0)
+
+    let db: sqlite.Database = seeded()
+    assert(db.lastInsertId() == 3)
+    assert(db.queryInt("SELECT count(*) FROM users") == 3)
+    let grace: string? = db.queryString("SELECT name FROM users WHERE id = 2")
+    assert(grace != null)
+    if (grace != null) {
+        assert(grace == "grace")
+    }
+    assert(db.queryString("SELECT name FROM users WHERE id = 99") == null)
+
+    let q: sqlite.Statement = db.prepare("SELECT id, name, age, score FROM users WHERE age >= ? ORDER BY id")
+    q.bindInt(1, 31)
+    let cols: string[] = q.columns()
+    assert(cols.len() == 4)
+    assert(cols[1] == "name")
+    let seen: string[] = []
+    while (q.next()) {
+        seen.push(q.getText(1))
+        assert(q.getLong(0) >= 2)
+        assert(q.getDouble(3) > 0.0)
+    }
+    assert(seen.len() == 2)
+    assert(seen[0] == "grace")
+    assert(seen[1] == "linus")
+
+    let upd: sqlite.Statement = db.prepare("UPDATE users SET name = ? WHERE age > ?")
+    upd.bindNull(1).bindInt(2, 30)
+    assert(upd.run() == 2)
+    assert(db.queryString("SELECT name FROM users WHERE id = 3") == null)
+
+    let caught: bool = false
+    try {
+        db.exec("SELECT * FROM missing")
+    } catch (e: sqlite.SqliteError) {
+        caught = true
+        assert(e.message.contains("missing"))
+        assert(e.code == 1)
+    }
+    assert(caught)
+
+    let failed: bool = false
+    try {
+        sqlite.open("/no/such/dir/x.db")
+    } catch (e: sqlite.SqliteError) {
+        failed = true
+    }
+    assert(failed)
+
+    for (let i: int = 0; i < 100; i++) {
+        let scratch: sqlite.Database = seeded()
+        assert(scratch.queryInt("SELECT sum(age) FROM users") == 93)
+    }
+
+    fmt.println("sqlite_test: all assertions passed")
+}
+
+fn main(): void {
+    try {
+        run()
+    } catch (e: sqlite.SqliteError) {
+        fmt.println("sqlite_test failed: " + e.message)
+        assert(false)
+    }
+}

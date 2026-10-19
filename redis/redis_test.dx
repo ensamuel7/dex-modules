@@ -1,0 +1,86 @@
+import "fmt"
+import "str"
+import "github.com/ensamuel7/dex-modules/redis"
+
+fn run(): void throws redis.RedisError {
+    let r: redis.Client = redis.connect("127.0.0.1", 6379)
+    assert(r.ping() == "PONG")
+
+    r.del("dexmod:name")
+    assert(r.get("dexmod:name") == null)
+    r.set("dexmod:name", "hello world")
+    let name: string? = r.get("dexmod:name")
+    assert(name != null)
+    if (name != null) {
+        assert(name == "hello world")
+    }
+    assert(r.exists("dexmod:name"))
+    assert(r.del("dexmod:name") == 1)
+    assert(!r.exists("dexmod:name"))
+
+    r.del("dexmod:count")
+    assert(r.incr("dexmod:count") == 1)
+    assert(r.incrBy("dexmod:count", 41) == 42)
+    assert(r.expire("dexmod:count", 60))
+    assert(r.ttl("dexmod:count") > 0)
+
+    r.del("dexmod:list")
+    r.rpush("dexmod:list", "a")
+    r.rpush("dexmod:list", "b")
+    r.lpush("dexmod:list", "z")
+    let list: string[] = r.lrange("dexmod:list", 0, -1)
+    assert(list.len() == 3)
+    assert(list[0] == "z")
+    assert(list[2] == "b")
+
+    r.del("dexmod:user")
+    r.hset("dexmod:user", "name", "ada")
+    r.hset("dexmod:user", "lang", "dex")
+    let user: map[string, string] = r.hgetall("dexmod:user")
+    assert(user.len() == 2)
+    assert(user.get("lang") == "dex")
+    assert(r.hget("dexmod:user", "missing") == null)
+
+    r.setex("dexmod:session", "x", 30)
+    assert(r.keys("dexmod:*").len() == 4)
+
+    let reply: redis.Reply = r.command(["ECHO", "100% safe %s"])
+    assert(reply.text == "100% safe %s")
+
+    let caught: bool = false
+    try {
+        r.command(["NOT_A_COMMAND"])
+    } catch (e: redis.RedisError) {
+        caught = true
+        assert(e.message.contains("unknown command"))
+    }
+    assert(caught)
+
+    let refused: bool = false
+    try {
+        redis.connect("127.0.0.1", 1)
+    } catch (e: redis.RedisError) {
+        refused = true
+    }
+    assert(refused)
+
+    for (let i: int = 0; i < 200; i++) {
+        r.set("dexmod:loop", str.fromInt(i))
+    }
+    r.del("dexmod:count")
+    r.del("dexmod:list")
+    r.del("dexmod:user")
+    r.del("dexmod:session")
+    r.del("dexmod:loop")
+
+    fmt.println("redis_test: all assertions passed")
+}
+
+fn main(): void {
+    try {
+        run()
+    } catch (e: redis.RedisError) {
+        fmt.println("redis_test failed: " + e.message)
+        assert(false)
+    }
+}

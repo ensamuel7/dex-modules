@@ -1,0 +1,190 @@
+external module c {
+    include "sqlite_shim.h"
+    pkg "sqlite3"
+
+    type Db closed by "sqlite3_close_v2"
+    type Stmt closed by "sqlite3_finalize"
+
+    fn open(path: string, db: &Db?): int = "sqlite3_open"
+    fn errmsg(db: Db): string = "sqlite3_errmsg"
+    fn exec(db: Db, sql: string): int = "sqlite_shim_exec"
+    fn prepare(db: Db, sql: string, n: int, stmt: &Stmt?, tail: &Stmt?): int = "sqlite3_prepare_v2"
+    fn bindText(s: Stmt, i: int, v: string): int = "sqlite_shim_bind_text"
+    fn bindInt(s: Stmt, i: int, v: int): int = "sqlite3_bind_int"
+    fn bindLong(s: Stmt, i: int, v: long): int = "sqlite3_bind_int64"
+    fn bindDouble(s: Stmt, i: int, v: double): int = "sqlite3_bind_double"
+    fn bindNull(s: Stmt, i: int): int = "sqlite3_bind_null"
+    fn step(s: Stmt): int = "sqlite3_step"
+    fn reset(s: Stmt): int = "sqlite3_reset"
+    fn clearBindings(s: Stmt): int = "sqlite3_clear_bindings"
+    fn columnCount(s: Stmt): int = "sqlite3_column_count"
+    fn columnName(s: Stmt, i: int): string = "sqlite3_column_name"
+    fn columnType(s: Stmt, i: int): int = "sqlite3_column_type"
+    fn columnInt(s: Stmt, i: int): int = "sqlite3_column_int"
+    fn columnLong(s: Stmt, i: int): long = "sqlite3_column_int64"
+    fn columnDouble(s: Stmt, i: int): double = "sqlite3_column_double"
+    fn columnText(s: Stmt, i: int): string = "sqlite_shim_column_text"
+    fn changes(db: Db): int = "sqlite3_changes"
+    fn lastInsertRowid(db: Db): long = "sqlite3_last_insert_rowid"
+    fn libVersion(): string = "sqlite3_libversion"
+}
+
+const OK: int = 0
+const ROW: int = 100
+const DONE: int = 101
+const NULL: int = 5
+
+struct SqliteError(message: string, code: int) {}
+
+struct Database {
+    handle: Db
+
+    fn exec(sql: string): void throws SqliteError {
+        let rc: int = c.exec(self.handle, sql)
+        if (rc != OK) {
+            throw SqliteError(c.errmsg(self.handle), rc)
+        }
+    }
+
+    fn prepare(sql: string): Statement throws SqliteError {
+        let st: Stmt? = null
+        let rc: int = c.prepare(self.handle, sql, -1, st, null)
+        if (rc != OK) {
+            throw SqliteError(c.errmsg(self.handle), rc)
+        }
+        if (st == null) {
+            throw SqliteError("no statement in: " + sql, rc)
+        }
+        return Statement { handle: st, db: self.handle }
+    }
+
+    fn changes(): int {
+        return c.changes(self.handle)
+    }
+
+    fn lastInsertId(): long {
+        return c.lastInsertRowid(self.handle)
+    }
+
+    fn queryInt(sql: string): int throws SqliteError {
+        let st: Statement = self.prepare(sql)
+        if (!st.next()) {
+            throw SqliteError("no rows: " + sql, DONE)
+        }
+        return st.getInt(0)
+    }
+
+    fn queryString(sql: string): string? throws SqliteError {
+        let st: Statement = self.prepare(sql)
+        if (!st.next() || st.isNull(0)) {
+            return null
+        }
+        return st.getText(0)
+    }
+}
+
+struct Statement {
+    handle: Stmt
+    db: Db
+
+    fn check(rc: int): void throws SqliteError {
+        if (rc != OK) {
+            throw SqliteError(c.errmsg(self.db), rc)
+        }
+    }
+
+    fn bindText(i: int, v: string): &Statement throws SqliteError {
+        self.check(c.bindText(self.handle, i, v))
+        return self
+    }
+
+    fn bindInt(i: int, v: int): &Statement throws SqliteError {
+        self.check(c.bindInt(self.handle, i, v))
+        return self
+    }
+
+    fn bindLong(i: int, v: long): &Statement throws SqliteError {
+        self.check(c.bindLong(self.handle, i, v))
+        return self
+    }
+
+    fn bindDouble(i: int, v: double): &Statement throws SqliteError {
+        self.check(c.bindDouble(self.handle, i, v))
+        return self
+    }
+
+    fn bindNull(i: int): &Statement throws SqliteError {
+        self.check(c.bindNull(self.handle, i))
+        return self
+    }
+
+    fn next(): bool throws SqliteError {
+        let rc: int = c.step(self.handle)
+        if (rc == ROW) {
+            return true
+        }
+        if (rc == DONE) {
+            return false
+        }
+        throw SqliteError(c.errmsg(self.db), rc)
+    }
+
+    fn run(): int throws SqliteError {
+        while (self.next()) {}
+        return c.changes(self.db)
+    }
+
+    fn reset(): void {
+        c.reset(self.handle)
+        c.clearBindings(self.handle)
+    }
+
+    fn columns(): string[] {
+        let names: string[] = []
+        let n: int = c.columnCount(self.handle)
+        for (let i: int = 0; i < n; i++) {
+            names.push(c.columnName(self.handle, i))
+        }
+        return names
+    }
+
+    fn isNull(i: int): bool {
+        return c.columnType(self.handle, i) == NULL
+    }
+
+    fn getInt(i: int): int {
+        return c.columnInt(self.handle, i)
+    }
+
+    fn getLong(i: int): long {
+        return c.columnLong(self.handle, i)
+    }
+
+    fn getDouble(i: int): double {
+        return c.columnDouble(self.handle, i)
+    }
+
+    fn getText(i: int): string {
+        return c.columnText(self.handle, i)
+    }
+}
+
+fn open(path: string): Database throws SqliteError {
+    let db: Db? = null
+    let rc: int = c.open(path, db)
+    if (db == null) {
+        throw SqliteError("out of memory opening " + path, rc)
+    }
+    if (rc != OK) {
+        throw SqliteError(c.errmsg(db), rc)
+    }
+    return Database { handle: db }
+}
+
+fn memory(): Database throws SqliteError {
+    return open(":memory:")
+}
+
+fn version(): string {
+    return c.libVersion()
+}

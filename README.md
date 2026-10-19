@@ -57,16 +57,18 @@ replace (
 )
 ```
 
-`replace` points each module at the folder beside it. Once they are published
-and `dex get` exists, delete the `replace` block and nothing else changes.
+`replace` points each module at the folder beside it.
 
 ## Running
 
 ```sh
 cd sqlite  && dex run sqlite_test.dx
-cd redis   && dex run redis_test.dx     # needs redis-server on 127.0.0.1:6379
-cd example   && dex run main.dx            # needs both
+cd redis   && dex run redis_test.dx
+cd example && dex run main.dx
 ```
+
+The redis test needs `redis-server` on `127.0.0.1:6379`, and the example needs
+both.
 
 ## Releasing
 

@@ -4,16 +4,19 @@ external module c {
     include "redis_shim.h"
     pkg "hiredis"
 
-    type Context closed by "redisFree"
+    type Pool closed by "redis_shim_pool_free"
+    type Socket closed by "redisFree"
     type Args closed by "redis_shim_args_free"
     type Raw closed by "freeReplyObject"
 
-    fn connect(host: string, port: int): Context? = "redisConnect"
-    fn failed(ctx: Context): bool = "redis_shim_failed"
-    fn error(ctx: Context): string = "redis_shim_error"
+    fn poolNew(host: string, port: int, password: string, size: int): Pool? = "redis_shim_pool_new"
+    fn poolCall(p: Pool, a: Args): Raw? = "redis_shim_pool_call"
+    fn dial(p: Pool): Socket? = "redis_shim_pool_dial"
+    fn send(conn: Socket, a: Args): Raw? = "redis_shim_send"
+    fn next(conn: Socket): Raw? = "redis_shim_next"
+    fn lastError(): string = "redis_shim_last_error"
     fn argsNew(): Args? = "redis_shim_args_new"
     fn argsPush(a: Args, s: string): void = "redis_shim_args_push"
-    fn call(ctx: Context, a: Args): Raw? = "redis_shim_args_call"
     fn kind(r: Raw): int = "redis_shim_type"
     fn integer(r: Raw): long = "redis_shim_integer"
     fn str(r: Raw): string = "redis_shim_str"
@@ -29,6 +32,7 @@ const INTEGER: int = 3
 const NIL: int = 4
 const STATUS: int = 5
 const ERROR: int = 6
+const POOL_SIZE: int = 8
 
 struct RedisError(message: string) {}
 
@@ -47,47 +51,105 @@ struct Reply {
     items: string[]
 }
 
-struct Client {
-    ctx: Context
+struct Message {
+    channel: string
+    pattern: string
+    payload: string
+}
 
-    fn command(args: string[]): Reply throws RedisError {
-        let a: Args? = c.argsNew()
-        if (a == null) {
-            throw RedisError("out of memory")
+private fn argsOf(args: string[]): Args throws RedisError {
+    let a: Args? = c.argsNew()
+    if (a == null) {
+        throw RedisError("out of memory")
+    }
+    foreach (args as arg) {
+        c.argsPush(a, arg)
+    }
+    return a
+}
+
+private fn itemsOf(r: Raw): string[] {
+    let items: string[] = []
+    let n: int = c.count(r)
+    for (let i: int = 0; i < n; i++) {
+        if (c.itemKind(r, i) == INTEGER) {
+            items.push(str.fromLong(c.itemInteger(r, i)))
+        } else {
+            items.push(c.itemStr(r, i))
         }
-        foreach (args as arg) {
-            c.argsPush(a, arg)
-        }
-        let r: Raw? = c.call(self.ctx, a)
-        if (r == null) {
-            throw RedisError(c.error(self.ctx))
-        }
-        let k: int = c.kind(r)
-        if (k == ERROR) {
-            throw RedisError(c.str(r))
-        }
-        if (k == INTEGER) {
-            return Reply { kind: Kind.Number, text: "", number: c.integer(r), items: [] }
-        }
-        if (k == NIL) {
-            return Reply { kind: Kind.Nil, text: "", number: 0, items: [] }
-        }
-        if (k == STATUS) {
-            return Reply { kind: Kind.Status, text: c.str(r), number: 0, items: [] }
-        }
-        if (k == ARRAY) {
-            let items: string[] = []
-            let n: int = c.count(r)
-            for (let i: int = 0; i < n; i++) {
-                if (c.itemKind(r, i) == INTEGER) {
-                    items.push(str.fromLong(c.itemInteger(r, i)))
-                } else {
-                    items.push(c.itemStr(r, i))
+    }
+    return items
+}
+
+private fn replyOf(raw: Raw?): Reply throws RedisError {
+    if (raw == null) {
+        throw RedisError(c.lastError())
+    }
+    let k: int = c.kind(raw)
+    if (k == ERROR) {
+        throw RedisError(c.str(raw))
+    }
+    if (k == INTEGER) {
+        return Reply { kind: Kind.Number, text: "", number: c.integer(raw), items: [] }
+    }
+    if (k == NIL) {
+        return Reply { kind: Kind.Nil, text: "", number: 0, items: [] }
+    }
+    if (k == STATUS) {
+        return Reply { kind: Kind.Status, text: c.str(raw), number: 0, items: [] }
+    }
+    if (k == ARRAY) {
+        return Reply { kind: Kind.List, text: "", number: 0, items: itemsOf(raw) }
+    }
+    return Reply { kind: Kind.Text, text: c.str(raw), number: 0, items: [] }
+}
+
+struct Subscriber {
+    conn: Socket
+
+    fn subscribe(channel: string): void throws RedisError {
+        replyOf(c.send(self.conn, argsOf(["SUBSCRIBE", channel])))
+    }
+
+    fn psubscribe(pattern: string): void throws RedisError {
+        replyOf(c.send(self.conn, argsOf(["PSUBSCRIBE", pattern])))
+    }
+
+    fn next(): Message? {
+        while (true) {
+            let raw: Raw? = c.next(self.conn)
+            if (raw == null) {
+                return null
+            }
+            if (c.kind(raw) == ARRAY) {
+                let items: string[] = itemsOf(raw)
+                if (items.len() == 3 && items[0] == "message") {
+                    return Message { channel: items[1], pattern: "", payload: items[2] }
+                }
+                if (items.len() == 4 && items[0] == "pmessage") {
+                    return Message { channel: items[2], pattern: items[1], payload: items[3] }
                 }
             }
-            return Reply { kind: Kind.List, text: "", number: 0, items: items }
         }
-        return Reply { kind: Kind.Text, text: c.str(r), number: 0, items: [] }
+        return null
+    }
+}
+
+struct Client {
+    pool: Pool
+
+    fn command(args: string[]): Reply throws RedisError {
+        return replyOf(c.poolCall(self.pool, argsOf(args)))
+    }
+
+    fn subscribe(channel: string): Subscriber throws RedisError {
+        let conn: Socket? = c.dial(self.pool)
+        if (conn == null) {
+            throw RedisError(c.lastError())
+        }
+        let sub: Subscriber = Subscriber { conn: conn }
+        sub.subscribe(channel)
+        return sub
     }
 
     fn ping(): string throws RedisError {
@@ -171,8 +233,24 @@ struct Client {
         return self.command(["LRANGE", key, str.fromInt(start), str.fromInt(stop)]).items
     }
 
+    fn hdel(key: string, field: string): long throws RedisError {
+        return self.command(["HDEL", key, field]).number
+    }
+
+    fn hkeys(key: string): string[] throws RedisError {
+        return self.command(["HKEYS", key]).items
+    }
+
     fn sadd(key: string, member: string): long throws RedisError {
         return self.command(["SADD", key, member]).number
+    }
+
+    fn srem(key: string, member: string): long throws RedisError {
+        return self.command(["SREM", key, member]).number
+    }
+
+    fn sismember(key: string, member: string): bool throws RedisError {
+        return self.command(["SISMEMBER", key, member]).number == 1
     }
 
     fn smembers(key: string): string[] throws RedisError {
@@ -184,13 +262,14 @@ struct Client {
     }
 }
 
-fn connect(host: string, port: int): Client throws RedisError {
-    let ctx: Context? = c.connect(host, port)
-    if (ctx == null) {
-        throw RedisError("out of memory connecting to " + host)
+fn connect(host: string, port: int, password: string): Client throws RedisError {
+    return connectPool(host, port, password, POOL_SIZE)
+}
+
+fn connectPool(host: string, port: int, password: string, size: int): Client throws RedisError {
+    let pool: Pool? = c.poolNew(host, port, password, size)
+    if (pool == null) {
+        throw RedisError(c.lastError())
     }
-    if (c.failed(ctx)) {
-        throw RedisError(c.error(ctx))
-    }
-    return Client { ctx: ctx }
+    return Client { pool: pool }
 }

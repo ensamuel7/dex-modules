@@ -40,7 +40,7 @@ fn run(): void throws sqlite.SqliteError, redis.RedisError {
         ins.reset()
     }
 
-    let cache: redis.Client = redis.connect("127.0.0.1", 6379)
+    let cache: redis.Client = redis.connect("127.0.0.1", 6379, "")
     cache.del("user:2")
     for (let pass: int = 0; pass < 2; pass++) {
         let u: User? = loadUser(db, cache, 2)

@@ -3,7 +3,7 @@ import "str"
 import "github.com/ensamuel7/dex-modules/redis"
 
 fn run(): void throws redis.RedisError {
-    let r: redis.Client = redis.connect("127.0.0.1", 6379)
+    let r: redis.Client = redis.connect("127.0.0.1", 6379, "")
     assert(r.ping() == "PONG")
 
     r.del("dexmod:name")
@@ -56,9 +56,18 @@ fn run(): void throws redis.RedisError {
     }
     assert(caught)
 
+    let badAuth: bool = false
+    try {
+        redis.connect("127.0.0.1", 6379, "not-the-password")
+    } catch (e: redis.RedisError) {
+        badAuth = true
+        assert(e.message.contains("AUTH"))
+    }
+    assert(badAuth)
+
     let refused: bool = false
     try {
-        redis.connect("127.0.0.1", 1)
+        redis.connect("127.0.0.1", 1, "")
     } catch (e: redis.RedisError) {
         refused = true
     }
@@ -72,13 +81,99 @@ fn run(): void throws redis.RedisError {
     r.del("dexmod:user")
     r.del("dexmod:session")
     r.del("dexmod:loop")
+}
 
-    fmt.println("redis_test: all assertions passed")
+fn bump(r: redis.Client, times: int): int {
+    let done: int = 0
+    try {
+        for (let i: int = 0; i < times; i++) {
+            r.incr("dexmod:shared")
+            done++
+        }
+    } catch (e: redis.RedisError) {
+        return -1
+    }
+    return done
+}
+
+fn pubsub(r: redis.Client): void throws redis.RedisError {
+    let sub: redis.Subscriber = r.subscribe("dexmod:chan")
+    sub.psubscribe("dexmod:pat:*")
+    r.publish("dexmod:chan", "one")
+    r.publish("dexmod:pat:x", "two")
+    r.publish("dexmod:chan", "three has spaces")
+    let m1: redis.Message? = sub.next()
+    let m2: redis.Message? = sub.next()
+    let m3: redis.Message? = sub.next()
+    assert(m1 != null && m2 != null && m3 != null)
+    if (m1 != null) {
+        assert(m1.channel == "dexmod:chan")
+        assert(m1.payload == "one")
+    }
+    if (m2 != null) {
+        assert(m2.channel == "dexmod:pat:x")
+        assert(m2.pattern == "dexmod:pat:*")
+        assert(m2.payload == "two")
+    }
+    if (m3 != null) {
+        assert(m3.payload == "three has spaces")
+    }
+}
+
+fn listen(sub: redis.Subscriber, count: int): string {
+    let got: string = ""
+    for (let i: int = 0; i < count; i++) {
+        let m: redis.Message? = sub.next()
+        if (m == null) {
+            return got + "<dropped>"
+        }
+        got = got + m.payload + ";"
+    }
+    return got
+}
+
+fn background(r: redis.Client): void throws redis.RedisError {
+    let sub: redis.Subscriber = r.subscribe("dexmod:jobs")
+    let ch = channel(string)
+    spawn {
+        send(ch, listen(sub, 3))
+    }
+    r.publish("dexmod:jobs", "a")
+    r.publish("dexmod:jobs", "b")
+    r.publish("dexmod:jobs", "c")
+    assert(receive(ch) == "a;b;c;")
+}
+
+fn threads(r: redis.Client): void throws redis.RedisError {
+    r.del("dexmod:shared")
+    let ch = channel(int)
+    for (let t: int = 0; t < 16; t++) {
+        spawn {
+            send(ch, bump(r, 50))
+        }
+    }
+    let total: int = 0
+    for (let t: int = 0; t < 16; t++) {
+        total += receive(ch)
+    }
+    assert(total == 800)
+    let count: string? = r.get("dexmod:shared")
+    if (count != null) {
+        assert(count == "800")
+    }
+    r.del("dexmod:shared")
 }
 
 fn main(): void {
     try {
         run()
+        let r: redis.Client = redis.connect("127.0.0.1", 6379, "")
+        pubsub(r)
+        background(r)
+        threads(r)
+        let small: redis.Client = redis.connectPool("127.0.0.1", 6379, "", 2)
+        threads(small)
+        fmt.println("redis_test: all assertions passed")
     } catch (e: redis.RedisError) {
         fmt.println("redis_test failed: " + e.message)
         assert(false)

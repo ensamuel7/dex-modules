@@ -43,21 +43,36 @@ The header holds what a declaration cannot say: a C function pointer argument
 
 ## Using them from a program
 
+```sh
+dex mod init github.com/acme/app
+dex get github.com/ensamuel7/dex-modules/redis
+dex get github.com/ensamuel7/dex-modules/sqlite@v0.1.0
 ```
-module github.com/ensamuel7/dex-modules/example
 
-require (
-    github.com/ensamuel7/dex-modules/sqlite v0.1.0
-    github.com/ensamuel7/dex-modules/redis v0.1.0
-)
+```dex
+import "github.com/ensamuel7/dex-modules/redis"
 
+let r: redis.Client = redis.connect("127.0.0.1", 6379, "")
+```
+
+`dex get` downloads the release into the module cache and writes `dex.mod` and
+`dex.sum`; commit both. A Dockerfile or CI runs `dex mod download` before
+building. The image needs `git`, and the C library each package wraps
+(`libhiredis-dev`, `libsqlite3-dev`).
+
+### Working on a package and a program together
+
+`example/` reads both packages from the folders beside it instead of the cache:
+
+```
 replace (
     github.com/ensamuel7/dex-modules/sqlite => ../sqlite
     github.com/ensamuel7/dex-modules/redis => ../redis
 )
 ```
 
-`replace` points each module at the folder beside it.
+A program changing one of these packages does the same with a `replace` to its
+checkout, and deletes the line once the change is released.
 
 ## Running
 
@@ -74,3 +89,12 @@ both.
 
 Each module is versioned on its own, with a tag that starts with its folder:
 `sqlite/v0.1.0`, `redis/v0.1.0`. A fix to one does not release the other.
+
+```sh
+git tag redis/v0.2.0
+git push origin redis/v0.2.0
+```
+
+`dex get github.com/ensamuel7/dex-modules/redis` then picks it up as the latest
+release. Never move or delete a tag once pushed: every project that fetched it
+has its checksum in `dex.sum`, and a moved tag fails their builds.

@@ -25,10 +25,11 @@ let built: q.Query = active.build(q.Dialect.Postgres)
 `build` throws `q.QueryError` for a query that cannot be written: a feature the
 dialect lacks, an UPDATE with no condition, a malformed name.
 
-Needs **dex 0.9.14 or later**. An older compiler fails inside `dexqu.dx` with
-errors such as `undefined function 'noNodes'`. Run `make install` in the
-compiler repo (or `dex update`) first. Until `dex.mod` can say this itself, the
-note here is the only place it is written (see `dex-samples/problems/002`).
+Needs **dex 0.9.14 or later**, which `dex.mod` records as `dex 0.9.14`. A
+compiler that reads that directive refuses an older version at the import, with
+an error that says to upgrade. One from before the directive existed fails
+inside `dexqu.dx` instead, with errors such as `undefined function 'noNodes'`.
+Either way, run `make install` in the compiler repo (or `dex update`) first.
 
 ## Three rules
 
@@ -246,8 +247,6 @@ once the compiler is fixed:
 - `from()` and `select()` set fields rather than call the methods of the same
   name. Inside a module, a method call named like one of the module's own
   functions resolves to the function.
-- A `throw` of a borrowed string passes `"" + s`. A throw releases the string
-  it is given as if it owned it, and the borrowed one is freed early.
 - Rendering records an error and returns, and `build` throws it. A throw out
   of a method call on a struct local leaks that local's fields.
 - `Binder` keeps its errors in an array it pushes to, not a string field it
@@ -258,10 +257,6 @@ once the compiler is fixed:
 - An enum that names a struct which names it back (`Node.Sub(Select)`) checks
   only when the file is read as a module, so `dex lint dexqu.dx` on its own
   reports unknown types. Lint the tests instead.
-- `dex format` joins a chain written one `.method()` per line, then breaks it
-  inside the first call's parentheses. Where a long chain comes out badly,
-  build it in steps: `s = s.where(..)`. Written up as
-  `dex-samples/problems/001-formatter-method-chains.md`.
 
 ## Running the tests
 

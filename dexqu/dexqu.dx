@@ -27,8 +27,6 @@ enum Value {
     Bool(bool)
 }
 
-// A throw releases the string it is given as if it owned it, so a borrowed
-// one (a field, a pattern binding) is handed over as a fresh copy: "" + s.
 struct QueryError(message: string) {}
 
 enum Node {
@@ -661,7 +659,7 @@ struct Select {
         let sb = StringBuilder()
         r.selectSql(sb, self.clone())
         if (!r.err.isEmpty()) {
-            throw QueryError("" + r.err)
+            throw QueryError(r.err)
         }
 
         return r.finish(sb)
@@ -788,7 +786,7 @@ struct Insert {
         let sb = StringBuilder()
         r.insertSql(sb, self.clone())
         if (!r.err.isEmpty()) {
-            throw QueryError("" + r.err)
+            throw QueryError(r.err)
         }
 
         return r.finish(sb)
@@ -852,7 +850,7 @@ struct Update {
         let sb = StringBuilder()
         r.updateSql(sb, self.clone())
         if (!r.err.isEmpty()) {
-            throw QueryError("" + r.err)
+            throw QueryError(r.err)
         }
 
         return r.finish(sb)
@@ -898,7 +896,7 @@ struct Delete {
         let sb = StringBuilder()
         r.deleteSql(sb, self.clone())
         if (!r.err.isEmpty()) {
-            throw QueryError("" + r.err)
+            throw QueryError(r.err)
         }
 
         return r.finish(sb)
@@ -1062,7 +1060,7 @@ struct Binder {
     fn args(): Value[] throws QueryError {
         let problems: string[] = self.problems
         if (problems.len() > 0) {
-            throw QueryError("" + problems[0])
+            throw QueryError(problems[0])
         }
 
         for (let i: int = 0; i < self.bound.len(); i++) {
@@ -1359,8 +1357,8 @@ struct Renderer {
             case Node.Param(name): {
                 self.param(sb, name)
             }
-            case Node.Raw(sql, holes): {
-                self.raw(sb, sql, holes)
+            case Node.Raw(sql, args): {
+                self.raw(sb, sql, args)
             }
             case Node.Prefix(op, a): {
                 sb.append(op)
@@ -1410,7 +1408,7 @@ struct Renderer {
                 self.list(sb, items, ", ")
                 sb.append(")")
             }
-            case Node.Call(name, callArgs): {
+            case Node.Call(name, args): {
                 if (!validName(name)) {
                     self.fail("'" + name + "' is not a function name")
                     return
@@ -1418,7 +1416,7 @@ struct Renderer {
 
                 sb.append(name)
                 sb.append("(")
-                self.list(sb, callArgs, ", ")
+                self.list(sb, args, ", ")
                 sb.append(")")
             }
             case Node.Alias(a, name): {
@@ -1484,18 +1482,18 @@ struct Renderer {
                 sb.append(sqlType)
                 sb.append(")")
             }
-            case Node.Case(whens, thens): {
+            case Node.Case(conds, results): {
                 sb.append("CASE")
-                for (let i: int = 0; i < whens.len(); i++) {
+                for (let i: int = 0; i < conds.len(); i++) {
                     sb.append(" WHEN ")
-                    self.node(sb, whens[i])
+                    self.node(sb, conds[i])
                     sb.append(" THEN ")
-                    self.node(sb, thens[i])
+                    self.node(sb, results[i])
                 }
 
-                if (thens.len() > whens.len()) {
+                if (results.len() > conds.len()) {
                     sb.append(" ELSE ")
-                    self.node(sb, thens[whens.len()])
+                    self.node(sb, results[conds.len()])
                 }
 
                 sb.append(" END")

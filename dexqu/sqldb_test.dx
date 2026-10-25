@@ -20,26 +20,27 @@ fn run(conn: int): void throws q.QueryError {
         "CREATE TABLE players(id INTEGER PRIMARY KEY, name TEXT UNIQUE, team TEXT, score REAL, active INT DEFAULT 1)"
     )
 
-    let add: q.Insert = q.insertInto("players").columns(["name", "team", "score"])
-    add = add.values([q.text("ada"), q.text("red"), q.real(9.5)])
-    add = add.values([q.text("grace"), q.text("blue"), q.real(7.0)])
-    add = add.values([q.text("O'Brien; DROP TABLE players; --"), q.text("red"), q.real(3.25)])
+    let add: q.Insert = q.insertInto("players")
+        .columns(["name", "team", "score"])
+        .values([q.text("ada"), q.text("red"), q.real(9.5)])
+        .values([q.text("grace"), q.text("blue"), q.real(7.0)])
+        .values([q.text("O'Brien; DROP TABLE players; --"), q.text("red"), q.real(3.25)])
     sqldb.exec(conn, add.build(LITE))
 
     // The same name again: the upsert updates the score instead of failing.
-    let again: q.Insert = q.insertInto("players").columns(["name", "team", "score"]).values([
-        q.text("ada"),
-        q.text("red"),
-        q.real(10.0)
-    ]).onConflict(["name"]).doUpdate(["score"])
+    let again: q.Insert = q.insertInto("players")
+        .columns(["name", "team", "score"])
+        .values([q.text("ada"), q.text("red"), q.real(10.0)])
+        .onConflict(["name"])
+        .doUpdate(["score"])
     sqldb.exec(conn, again.build(LITE))
 
     // Columns from the struct, rows filled into it.
     let p: Player = Player {}
-    let reds: q.Select = q.from("players").fields(
-        reflect.fields(p),
-        reflect.fieldTags(p, "db")
-    ).where(q.col("team").eq(q.text("red"))).orderBy("score DESC")
+    let reds: q.Select = q.from("players")
+        .fields(reflect.fields(p), reflect.fieldTags(p, "db"))
+        .where(q.col("team").eq(q.text("red")))
+        .orderBy("score DESC")
     let st: int = sqldb.query(conn, reds.build(LITE))
     let seen: string[] = []
     while (db.next(st)) {
@@ -54,11 +55,11 @@ fn run(conn: int): void throws q.QueryError {
     assert(p.score == 3.25)
 
     // Built once, run with different values.
-    let byTeam: q.Query = q.from(
-        "players"
-    ).select([
-        q.countAll()
-    ]).where(q.col("team").eq(q.param("team"))).where(q.col("active").eq(q.boolean(true))).build(LITE)
+    let byTeam: q.Query = q.from("players")
+        .select([q.countAll()])
+        .where(q.col("team").eq(q.param("team")))
+        .where(q.col("active").eq(q.boolean(true)))
+        .build(LITE)
     let blue: int = sqldb.prepare(conn, byTeam.sql, byTeam.bind().setText("team", "blue").args())
     assert(db.next(blue))
     let blues: int = db.col(blue, 0)
@@ -76,10 +77,10 @@ fn run(conn: int): void throws q.QueryError {
     db.finalize(top)
     assert(best == 10.0)
 
-    let bench: q.Update = q.update("players").set(
-        "active",
-        q.boolean(false)
-    ).where(q.col("score").lt(q.real(5.0))).returning(["name"])
+    let bench: q.Update = q.update("players")
+        .set("active", q.boolean(false))
+        .where(q.col("score").lt(q.real(5.0)))
+        .returning(["name"])
     let benched: int = sqldb.query(conn, bench.build(LITE))
     assert(db.next(benched))
     let who: string = db.col(benched, 0)

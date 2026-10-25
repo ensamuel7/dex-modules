@@ -77,10 +77,11 @@ fn textAt(args: q.Value[], i: int): string {
 }
 
 fn selects(): void {
-    let basic: q.Select = q.from("users u").columns([
-        "u.id",
-        "u.name AS n"
-    ]).where(q.col("u.age").gte(q.integer(18))).orderBy("u.name DESC").limit(10)
+    let basic: q.Select = q.from("users u")
+        .columns(["u.id", "u.name AS n"])
+        .where(q.col("u.age").gte(q.integer(18)))
+        .orderBy("u.name DESC")
+        .limit(10)
     check(
         sel(basic, PG),
         "SELECT \"u\".\"id\", \"u\".\"name\" AS \"n\" FROM \"users\" AS \"u\" WHERE \"u\".\"age\" >= $1 ORDER BY \"u\".\"name\" DESC LIMIT $2"
@@ -167,20 +168,20 @@ fn conditions(): void {
 }
 
 fn shapes(): void {
-    let report: q.Select = q.from("orders").select([
-        q.col("user_id"),
-        q.count(q.col("id")).alias("n"),
-        q.sum(q.col("total")).alias("spent")
-    ]).groupBy(["user_id"]).having(q.countAll().gt(q.integer(5))).orderByExpr(q.sum(q.col("total")).desc())
+    let report: q.Select = q.from("orders")
+        .select([q.col("user_id"), q.count(q.col("id")).alias("n"), q.sum(q.col("total")).alias("spent")])
+        .groupBy(["user_id"])
+        .having(q.countAll().gt(q.integer(5)))
+        .orderByExpr(q.sum(q.col("total")).desc())
     check(
         sel(report, PG),
         "SELECT \"user_id\", COUNT(\"id\") AS \"n\", SUM(\"total\") AS \"spent\" FROM \"orders\" GROUP BY \"user_id\" HAVING COUNT(*) > $1 ORDER BY SUM(\"total\") DESC"
     )
 
-    let joined: q.Select = q.from("users u").columns(["u.id", "o.total"]).join(
-        "orders o",
-        q.col("o.user_id").eq(q.col("u.id"))
-    ).leftJoin("profiles p", q.col("p.user_id").eq(q.col("u.id")).and(q.col("p.public").eq(q.boolean(true))))
+    let joined: q.Select = q.from("users u")
+        .columns(["u.id", "o.total"])
+        .join("orders o", q.col("o.user_id").eq(q.col("u.id")))
+        .leftJoin("profiles p", q.col("p.user_id").eq(q.col("u.id")).and(q.col("p.public").eq(q.boolean(true))))
     check(
         sel(joined, PG),
         "SELECT \"u\".\"id\", \"o\".\"total\" FROM \"users\" AS \"u\" JOIN \"orders\" AS \"o\" ON \"o\".\"user_id\" = \"u\".\"id\" LEFT JOIN \"profiles\" AS \"p\" ON \"p\".\"user_id\" = \"u\".\"id\" AND \"p\".\"public\" = TRUE"
@@ -259,10 +260,10 @@ fn expressions(): void {
     check(sel(q.from("t").where(q.rawWith("a = ?", noHoles)), PG), "error: more ? than arguments in: a = ?")
     check(sel(q.from("t").where(q.rawWith("a = 1", [q.integer(1)])), PG), "error: fewer ? than arguments in: a = 1")
 
-    let grade: q.Expr = q.caseWhen(q.col("score").gte(q.integer(90)), q.text("A")).when(
-        q.col("score").gte(q.integer(80)),
-        q.text("B")
-    ).orElse(q.text("C")).alias("grade")
+    let grade: q.Expr = q.caseWhen(q.col("score").gte(q.integer(90)), q.text("A"))
+        .when(q.col("score").gte(q.integer(80)), q.text("B"))
+        .orElse(q.text("C"))
+        .alias("grade")
     check(
         sel(q.from("t").select([grade]), PG),
         "SELECT CASE WHEN \"score\" >= $1 THEN $2 WHEN \"score\" >= $3 THEN $4 ELSE $5 END AS \"grade\" FROM \"t\""
@@ -309,14 +310,11 @@ fn quoting(): void {
 }
 
 fn params(): void {
-    let tpl: q.Select =
-        q.from(
-            "users"
-        ).where(
-            q.col("id").eq(q.param("id"))
-        ).where(
-            q.col("org").eq(q.param("org"))
-        ).where(q.col("owner").eq(q.param("id"))).where(q.col("age").gt(q.integer(21)))
+    let tpl: q.Select = q.from("users")
+        .where(q.col("id").eq(q.param("id")))
+        .where(q.col("org").eq(q.param("org")))
+        .where(q.col("owner").eq(q.param("id")))
+        .where(q.col("age").gt(q.integer(21)))
     check(
         sel(tpl, PG),
         "SELECT * FROM \"users\" WHERE \"id\" = $1 AND \"org\" = $2 AND \"owner\" = $1 AND \"age\" > $3"
@@ -377,10 +375,11 @@ fn projection(): void {
 }
 
 fn inserts(): void {
-    let two: q.Insert = q.insertInto("users").columns(["name", "age"]).values([q.text("ada"), q.integer(36)]).values([
-        q.text("grace"),
-        q.integer(45)
-    ]).returning(["id"])
+    let two: q.Insert = q.insertInto("users")
+        .columns(["name", "age"])
+        .values([q.text("ada"), q.integer(36)])
+        .values([q.text("grace"), q.integer(45)])
+        .returning(["id"])
     check(ins(two, PG), "INSERT INTO \"users\" (\"name\", \"age\") VALUES ($1, $2), ($3, $4) RETURNING \"id\"")
     check(ins(two, MY), "error: MySQL has no RETURNING")
     check(
@@ -388,10 +387,10 @@ fn inserts(): void {
         "INSERT INTO \"users\" (\"name\", \"active\") VALUES ($1, TRUE)"
     )
 
-    let up: q.Insert = q.insertInto("users").columns(["email", "name"]).values([
-        q.text("a@x"),
-        q.text("A")
-    ]).onConflict(["email"])
+    let up: q.Insert = q.insertInto("users")
+        .columns(["email", "name"])
+        .values([q.text("a@x"), q.text("A")])
+        .onConflict(["email"])
     check(
         ins(up.doUpdate(["name"]), PG),
         "INSERT INTO \"users\" (\"email\", \"name\") VALUES ($1, $2) ON CONFLICT (\"email\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""
@@ -415,9 +414,9 @@ fn inserts(): void {
         "error: doUpdate() needs onConflict(columns) to name the unique key"
     )
 
-    let archive: q.Insert = q.insertInto(
-        "archive"
-    ).columns(["id"]).fromSelect(q.from("users").columns(["id"]).where(q.col("active").eq(q.boolean(false))))
+    let archive: q.Insert = q.insertInto("archive")
+        .columns(["id"])
+        .fromSelect(q.from("users").columns(["id"]).where(q.col("active").eq(q.boolean(false))))
     check(ins(archive, PG), "INSERT INTO \"archive\" (\"id\") SELECT \"id\" FROM \"users\" WHERE \"active\" = FALSE")
     check(
         ins(archive.doNothing(), LITE),
@@ -466,10 +465,11 @@ fn bulk(): void {
 }
 
 fn updatesAndDeletes(): void {
-    let u: q.Update = q.update("users").set("name", q.text("x")).set(
-        "visits",
-        q.col("visits").plus(q.integer(1))
-    ).where(q.col("id").eq(q.integer(3))).returning(["id"])
+    let u: q.Update = q.update("users")
+        .set("name", q.text("x"))
+        .set("visits", q.col("visits").plus(q.integer(1)))
+        .where(q.col("id").eq(q.integer(3)))
+        .returning(["id"])
     check(
         upd(u, PG),
         "UPDATE \"users\" SET \"name\" = $1, \"visits\" = (\"visits\" + $2) WHERE \"id\" = $3 RETURNING \"id\""

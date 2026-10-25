@@ -87,16 +87,39 @@ cd example && dex run main.dx
 The redis test needs `redis-server` on `127.0.0.1:6379`, and the example needs
 both.
 
-## Releasing
+## Branches and releases
 
 Each module is versioned on its own, with a tag that starts with its folder:
-`sqlite/v0.1.0`, `redis/v0.1.0`, `dexqu/v0.1.0`. A fix to one does not release the other.
+`sqlite/v0.1.0`, `redis/v0.1.0`. A fix to one does not release the other. A
+module's first release is `v0.1.0`, and it stays below `v1.0.0` while its API
+may still change.
 
-```sh
-git tag redis/v0.2.0
-git push origin redis/v0.2.0
+Work on a module happens on a branch named after the module and the change,
+never after a version:
+
+```
+dexqu/query-builder      redis/cluster-support      sqlite/fix-busy-timeout
 ```
 
-`dex get github.com/ensamuel7/dex-modules/redis` then picks it up as the latest
+A branch must not share a name with a tag. `dex get` fetches a release with
+`git clone --branch <tag>`, and when a branch and a tag share a name, git
+clones the branch. A branch called `dexqu/v0.2.0` would be served in place of
+the release, and every push to it would change what `dex get` downloads and
+fail the checksum in every `dex.sum`.
+
+To release, merge the branch into `main` and tag the merge commit on `main`:
+
+```sh
+git checkout main && git pull
+git tag dexqu/v0.1.0
+git push origin dexqu/v0.1.0
+```
+
+Tag `main` rather than the branch, so that every release is in `main`'s
+history. Bump the patch for a fix, the minor for anything new or, below
+`v1.0.0`, anything breaking. Each module's README says which version of dex it
+needs.
+
+`dex get github.com/ensamuel7/dex-modules/dexqu` then picks it up as the latest
 release. Never move or delete a tag once pushed: every project that fetched it
 has its checksum in `dex.sum`, and a moved tag fails their builds.

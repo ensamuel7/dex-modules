@@ -25,6 +25,11 @@ let built: q.Query = active.build(q.Dialect.Postgres)
 `build` throws `q.QueryError` for a query that cannot be written: a feature the
 dialect lacks, an UPDATE with no condition, a malformed name.
 
+Needs **dex 0.9.14 or later**. An older compiler fails inside `dexqu.dx` with
+errors such as `undefined function 'noNodes'`. Run `make install` in the
+compiler repo (or `dex update`) first. Until `dex.mod` can say this itself, the
+note here is the only place it is written (see `dex-samples/problems/002`).
+
 ## Three rules
 
 **Builders are values.** Every method returns a new builder and leaves its
@@ -255,7 +260,8 @@ once the compiler is fixed:
   reports unknown types. Lint the tests instead.
 - `dex format` joins a chain written one `.method()` per line, then breaks it
   inside the first call's parentheses. Where a long chain comes out badly,
-  build it in steps: `s = s.where(..)`.
+  build it in steps: `s = s.where(..)`. Written up as
+  `dex-samples/problems/001-formatter-method-chains.md`.
 
 ## Running the tests
 

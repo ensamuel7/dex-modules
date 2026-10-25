@@ -1,0 +1,2172 @@
+// dexqu: a SQL query builder.
+//
+// A query is a tree of Nodes, built by immutable values (Expr, Select, Insert,
+// Update, Delete) and rendered once, for one dialect, into one StringBuilder.
+// Placeholders are numbered as they are written and every value travels in
+// Query.args, never in the SQL text.
+//
+// Clause lists are persistent: each is a chain of Cons nodes, so a builder
+// method allocates one node and shares everything before it. Two queries
+// branched from one base share the base, and since nodes never change after
+// they are made, a base may be shared between threads.
+
+import "num"
+
+enum Dialect {
+    Postgres
+    MySQL
+    SQLite
+}
+
+// A value bound to a placeholder.
+enum Value {
+    Null
+    Int(long)
+    Real(double)
+    Text(string)
+    Bool(bool)
+}
+
+// A throw releases the string it is given as if it owned it, so a borrowed
+// one (a field, a pattern binding) is handed over as a fresh copy: "" + s.
+struct QueryError(message: string) {}
+
+enum Node {
+    Nil
+    Cons(Node, Node)
+    Chunk(Node[])
+    Ident(string)
+    Star
+    Lit(Value)
+    Param(string)
+    Raw(string, Node[])
+    Prefix(string, Node)
+    Suffix(Node, string)
+    Binary(Node, string, Node)
+    Many(string, Node[])
+    Tuple(Node[])
+    Call(string, Node[])
+    Alias(Node, string)
+    Sub(Select)
+    InList(Node, string, Node[])
+    Between(Node, string, Node, Node)
+    Concat(Node[])
+    Cast(Node, string)
+    Case(Node[], Node[])
+    Over(Node, Node[], Node[])
+    Excluded(string)
+    Join(string, Node, Node)
+    Using(string, Node, string[])
+    Compound(string, Select)
+    Cte(string, Select)
+    Bad(string)
+}
+
+// Rows of an INSERT are folded into one Chunk every ROW_CHUNK rows, so the
+// chain a long insert builds stays short: releasing a chain recurses once per
+// node, and a worker thread's stack holds about 10,000 levels.
+const ROW_CHUNK: int = 256
+
+struct Expr {
+    private node: Node
+
+    fn eq(v: Expr): Expr {
+        if (isNullLit(v.node)) {
+            return wrap(Node.Suffix(self.node, "IS NULL"))
+        }
+
+        return wrap(Node.Binary(self.node, "=", v.node))
+    }
+
+    fn neq(v: Expr): Expr {
+        if (isNullLit(v.node)) {
+            return wrap(Node.Suffix(self.node, "IS NOT NULL"))
+        }
+
+        return wrap(Node.Binary(self.node, "<>", v.node))
+    }
+
+    fn lt(v: Expr): Expr {
+        return wrap(Node.Binary(self.node, "<", v.node))
+    }
+
+    fn lte(v: Expr): Expr {
+        return wrap(Node.Binary(self.node, "<=", v.node))
+    }
+
+    fn gt(v: Expr): Expr {
+        return wrap(Node.Binary(self.node, ">", v.node))
+    }
+
+    fn gte(v: Expr): Expr {
+        return wrap(Node.Binary(self.node, ">=", v.node))
+    }
+
+    fn isNull(): Expr {
+        return wrap(Node.Suffix(self.node, "IS NULL"))
+    }
+
+    fn isNotNull(): Expr {
+        return wrap(Node.Suffix(self.node, "IS NOT NULL"))
+    }
+
+    fn like(pattern: Expr): Expr {
+        return wrap(Node.Binary(self.node, "LIKE", pattern.node))
+    }
+
+    fn notLike(pattern: Expr): Expr {
+        return wrap(Node.Binary(self.node, "NOT LIKE", pattern.node))
+    }
+
+    // Case-insensitive LIKE: ILIKE on Postgres, LIKE elsewhere, where it
+    // already ignores ASCII case under the default collation.
+    fn ilike(pattern: Expr): Expr {
+        return wrap(Node.Binary(self.node, "ILIKE", pattern.node))
+    }
+
+    fn notIlike(pattern: Expr): Expr {
+        return wrap(Node.Binary(self.node, "NOT ILIKE", pattern.node))
+    }
+
+    fn in(list: Expr[]): Expr {
+        return wrap(Node.InList(self.node, "IN", nodesOf(list)))
+    }
+
+    fn notIn(list: Expr[]): Expr {
+        return wrap(Node.InList(self.node, "NOT IN", nodesOf(list)))
+    }
+
+    fn inSelect(q: Select): Expr {
+        return wrap(Node.Binary(self.node, "IN", Node.Sub(q)))
+    }
+
+    fn notInSelect(q: Select): Expr {
+        return wrap(Node.Binary(self.node, "NOT IN", Node.Sub(q)))
+    }
+
+    fn between(lo: Expr, hi: Expr): Expr {
+        return wrap(Node.Between(self.node, "BETWEEN", lo.node, hi.node))
+    }
+
+    fn notBetween(lo: Expr, hi: Expr): Expr {
+        return wrap(Node.Between(self.node, "NOT BETWEEN", lo.node, hi.node))
+    }
+
+    fn and(other: Expr): Expr {
+        return wrap(joined("AND", self.node, other.node))
+    }
+
+    fn or(other: Expr): Expr {
+        return wrap(joined("OR", self.node, other.node))
+    }
+
+    fn not(): Expr {
+        return wrap(Node.Prefix("NOT", self.node))
+    }
+
+    fn plus(v: Expr): Expr {
+        return wrap(Node.Binary(self.node, "+", v.node))
+    }
+
+    fn minus(v: Expr): Expr {
+        return wrap(Node.Binary(self.node, "-", v.node))
+    }
+
+    fn times(v: Expr): Expr {
+        return wrap(Node.Binary(self.node, "*", v.node))
+    }
+
+    fn div(v: Expr): Expr {
+        return wrap(Node.Binary(self.node, "/", v.node))
+    }
+
+    // String concatenation: || on Postgres and SQLite, CONCAT() on MySQL.
+    fn concat(v: Expr): Expr {
+        return wrap(Node.Concat([self.node, v.node]))
+    }
+
+    fn asc(): Expr {
+        return wrap(Node.Suffix(self.node, "ASC"))
+    }
+
+    fn desc(): Expr {
+        return wrap(Node.Suffix(self.node, "DESC"))
+    }
+
+    fn alias(name: string): Expr {
+        return wrap(Node.Alias(self.node, name))
+    }
+
+    // CAST(x AS type). The type is written into the SQL, so it is held to
+    // letters, digits, spaces, '_' and the parentheses and comma of
+    // varchar(20) or numeric(10, 2).
+    fn cast(sqlType: string): Expr {
+        return wrap(Node.Cast(self.node, sqlType))
+    }
+
+    // A window function: count().over([col("team")], [col("score").desc()]).
+    fn over(partitionBy: Expr[], orderBy: Expr[]): Expr {
+        return wrap(Node.Over(self.node, nodesOf(partitionBy), nodesOf(orderBy)))
+    }
+}
+
+// CASE WHEN ... THEN ... ELSE ... END, built with caseWhen(..).when(..).orElse(..).
+struct Case {
+    private conds: Node[]
+    private results: Node[]
+
+    fn when(cond: Expr, result: Expr): Case {
+        let conds: Node[] = copyNodes(self.conds)
+        let results: Node[] = copyNodes(self.results)
+        conds.push(cond.node)
+        results.push(result.node)
+        return Case { conds: conds, results: results }
+    }
+
+    fn orElse(result: Expr): Expr {
+        let results: Node[] = copyNodes(self.results)
+        results.push(result.node)
+        return wrap(Node.Case(self.conds, results))
+    }
+
+    fn end(): Expr {
+        return wrap(Node.Case(self.conds, self.results))
+    }
+}
+
+// ---- Expressions ----
+
+// A column or table name. A dot separates qualifiers, and each part is quoted
+// for the dialect: col("u.id") is "u"."id" on Postgres, `u`.`id` on MySQL.
+// col("u.*") selects every column of u.
+fn col(name: string): Expr {
+    return wrap(Node.Ident(name))
+}
+
+fn star(): Expr {
+    return wrap(Node.Star)
+}
+
+fn integer(v: int): Expr {
+    return wrap(Node.Lit(Value.Int(num.toLong(v))))
+}
+
+fn bigint(v: long): Expr {
+    return wrap(Node.Lit(Value.Int(v)))
+}
+
+fn real(v: double): Expr {
+    return wrap(Node.Lit(Value.Real(v)))
+}
+
+fn text(v: string): Expr {
+    return wrap(Node.Lit(Value.Text(v)))
+}
+
+// A bool is written into the SQL as TRUE or FALSE (1 or 0 on SQLite) rather
+// than bound: it carries no user text, and drivers disagree on binding one.
+fn boolean(v: bool): Expr {
+    return wrap(Node.Lit(Value.Bool(v)))
+}
+
+// NULL is written into the SQL. Comparing to it with eq or neq gives IS NULL
+// or IS NOT NULL, since = NULL is never true.
+fn sqlNull(): Expr {
+    return wrap(Node.Lit(Value.Null))
+}
+
+// A placeholder whose value is supplied later, through Query.bind. Lets a
+// query be built once and run many times with only its values changing.
+fn param(name: string): Expr {
+    return wrap(Node.Param(name))
+}
+
+// SQL written by hand. Each ? is replaced by the next of args, rendered as any
+// expression is (a value becomes a placeholder); ?? is a literal ?.
+fn raw(sql: string): Expr {
+    return wrap(Node.Raw(sql, noNodes()))
+}
+
+fn rawWith(sql: string, args: Expr[]): Expr {
+    return wrap(Node.Raw(sql, nodesOf(args)))
+}
+
+// Every condition, or any: and([]) is true and or([]) is false.
+fn and(conds: Expr[]): Expr {
+    return wrap(Node.Many("AND", nodesOf(conds)))
+}
+
+fn or(conds: Expr[]): Expr {
+    return wrap(Node.Many("OR", nodesOf(conds)))
+}
+
+fn not(cond: Expr): Expr {
+    return wrap(Node.Prefix("NOT", cond.node))
+}
+
+fn tuple(items: Expr[]): Expr {
+    return wrap(Node.Tuple(nodesOf(items)))
+}
+
+// A SQL function call. The name is written into the SQL, so it must be an
+// identifier: letters, digits, '_' and '.'.
+fn call(name: string, args: Expr[]): Expr {
+    return wrap(Node.Call(name, nodesOf(args)))
+}
+
+fn count(e: Expr): Expr {
+    return wrap(Node.Call("COUNT", [e.node]))
+}
+
+fn countAll(): Expr {
+    return wrap(Node.Call("COUNT", [Node.Star]))
+}
+
+fn countDistinct(e: Expr): Expr {
+    return wrap(Node.Call("COUNT", [Node.Prefix("DISTINCT", e.node)]))
+}
+
+fn sum(e: Expr): Expr {
+    return wrap(Node.Call("SUM", [e.node]))
+}
+
+fn avg(e: Expr): Expr {
+    return wrap(Node.Call("AVG", [e.node]))
+}
+
+fn min(e: Expr): Expr {
+    return wrap(Node.Call("MIN", [e.node]))
+}
+
+fn max(e: Expr): Expr {
+    return wrap(Node.Call("MAX", [e.node]))
+}
+
+fn coalesce(items: Expr[]): Expr {
+    return wrap(Node.Call("COALESCE", nodesOf(items)))
+}
+
+fn lower(e: Expr): Expr {
+    return wrap(Node.Call("LOWER", [e.node]))
+}
+
+fn upper(e: Expr): Expr {
+    return wrap(Node.Call("UPPER", [e.node]))
+}
+
+// A subquery used as a value, or with alias() as a table in fromExpr.
+fn sub(q: Select): Expr {
+    return wrap(Node.Sub(q))
+}
+
+fn exists(q: Select): Expr {
+    return wrap(Node.Prefix("EXISTS", Node.Sub(q)))
+}
+
+fn notExists(q: Select): Expr {
+    return wrap(Node.Prefix("NOT EXISTS", Node.Sub(q)))
+}
+
+// The value an upsert tried to insert into a column: EXCLUDED."c" on Postgres
+// and SQLite, VALUES(`c`) on MySQL.
+fn excluded(column: string): Expr {
+    return wrap(Node.Excluded(column))
+}
+
+fn caseWhen(cond: Expr, result: Expr): Case {
+    return Case { conds: [cond.node], results: [result.node] }
+}
+
+// ---- SELECT ----
+
+struct Select {
+    private ctes: Node
+    private recursive: bool
+    private unique: bool
+    private cols: Node
+    private sources: Node
+    private joins: Node
+    private wheres: Node
+    private groups: Node
+    private havings: Node
+    private orders: Node
+    private compounds: Node
+    private lim: Node
+    private off: Node
+    private lock: string
+    private err: string
+
+    private fn clone(): Select {
+        return Select {
+            ctes: self.ctes,
+            recursive: self.recursive,
+            unique: self.unique,
+            cols: self.cols,
+            sources: self.sources,
+            joins: self.joins,
+            wheres: self.wheres,
+            groups: self.groups,
+            havings: self.havings,
+            orders: self.orders,
+            compounds: self.compounds,
+            lim: self.lim,
+            off: self.off,
+            lock: self.lock,
+            err: self.err
+        }
+    }
+
+    // Columns by name. Each is "name", "t.name", "name AS alias" or
+    // "name alias"; every name is quoted, so a name from outside is safe here.
+    fn columns(names: string[]): Select {
+        let n: Select = self.clone()
+        foreach (names as name) {
+            n.cols = Node.Cons(n.cols, refOf(name))
+        }
+
+        return n
+    }
+
+    fn select(items: Expr[]): Select {
+        let n: Select = self.clone()
+        foreach (items as e) {
+            n.cols = Node.Cons(n.cols, e.node)
+        }
+
+        return n
+    }
+
+    // A column per struct field, in declaration order, for db.fill: the
+    // field's db tag if it has one, written as SQL, else the field name in
+    // snake_case. Pass reflect.fields(v) and reflect.fieldTags(v, "db").
+    fn fields(names: string[], tags: string[]): Select {
+        let n: Select = self.clone()
+        for (let i: int = 0; i < names.len(); i++) {
+            if (i < tags.len() && !tags[i].isEmpty()) {
+                n.cols = Node.Cons(n.cols, Node.Alias(Node.Raw(tags[i], noNodes()), names[i]))
+            } else {
+                n.cols = Node.Cons(n.cols, Node.Ident(snakeCase(names[i])))
+            }
+        }
+
+        return n
+    }
+
+    fn distinct(): Select {
+        let n: Select = self.clone()
+        n.unique = true
+        return n
+    }
+
+    // A table: "users", "public.users", "users u" or "users AS u".
+    fn from(table: string): Select {
+        let n: Select = self.clone()
+        n.sources = Node.Cons(n.sources, refOf(table))
+        return n
+    }
+
+    // A source that is not a plain table, usually sub(q).alias("t").
+    fn fromExpr(source: Expr): Select {
+        let n: Select = self.clone()
+        n.sources = Node.Cons(n.sources, source.node)
+        return n
+    }
+
+    fn join(table: string, on: Expr): Select {
+        return self.addJoin("JOIN", refOf(table), on.node)
+    }
+
+    fn leftJoin(table: string, on: Expr): Select {
+        return self.addJoin("LEFT JOIN", refOf(table), on.node)
+    }
+
+    fn rightJoin(table: string, on: Expr): Select {
+        return self.addJoin("RIGHT JOIN", refOf(table), on.node)
+    }
+
+    fn fullJoin(table: string, on: Expr): Select {
+        return self.addJoin("FULL JOIN", refOf(table), on.node)
+    }
+
+    fn crossJoin(table: string): Select {
+        return self.addJoin("CROSS JOIN", refOf(table), Node.Nil)
+    }
+
+    fn joinExpr(source: Expr, on: Expr): Select {
+        return self.addJoin("JOIN", source.node, on.node)
+    }
+
+    fn leftJoinExpr(source: Expr, on: Expr): Select {
+        return self.addJoin("LEFT JOIN", source.node, on.node)
+    }
+
+    fn joinUsing(table: string, columns: string[]): Select {
+        let n: Select = self.clone()
+        n.joins = Node.Cons(n.joins, Node.Using("JOIN", refOf(table), columns))
+        return n
+    }
+
+    private fn addJoin(kind: string, source: Node, on: Node): Select {
+        let n: Select = self.clone()
+        n.joins = Node.Cons(n.joins, Node.Join(kind, source, on))
+        return n
+    }
+
+    // Conditions given in separate calls are joined with AND.
+    fn where(cond: Expr): Select {
+        let n: Select = self.clone()
+        n.wheres = Node.Cons(n.wheres, cond.node)
+        return n
+    }
+
+    fn groupBy(columns: string[]): Select {
+        let n: Select = self.clone()
+        foreach (columns as c) {
+            n.groups = Node.Cons(n.groups, Node.Ident(c))
+        }
+
+        return n
+    }
+
+    fn groupByExpr(items: Expr[]): Select {
+        let n: Select = self.clone()
+        foreach (items as e) {
+            n.groups = Node.Cons(n.groups, e.node)
+        }
+
+        return n
+    }
+
+    fn having(cond: Expr): Select {
+        let n: Select = self.clone()
+        n.havings = Node.Cons(n.havings, cond.node)
+        return n
+    }
+
+    // "name", "name ASC" or "name DESC". The name is quoted and the direction
+    // must be one of those two words, so a sort key from a request is safe.
+    fn orderBy(spec: string): Select {
+        let n: Select = self.clone()
+        n.orders = Node.Cons(n.orders, orderOf(spec))
+        return n
+    }
+
+    fn orderByExpr(e: Expr): Select {
+        let n: Select = self.clone()
+        n.orders = Node.Cons(n.orders, e.node)
+        return n
+    }
+
+    // LIMIT and OFFSET are bound like any value, so every page of a query is
+    // the same SQL and one prepared statement serves them all.
+    fn limit(rows: int): Select {
+        return self.limitExpr(integer(rows))
+    }
+
+    fn offset(rows: int): Select {
+        return self.offsetExpr(integer(rows))
+    }
+
+    fn limitExpr(rows: Expr): Select {
+        let n: Select = self.clone()
+        n.lim = rows.node
+        return n
+    }
+
+    fn offsetExpr(rows: Expr): Select {
+        let n: Select = self.clone()
+        n.off = rows.node
+        return n
+    }
+
+    // Row locks. Not available on SQLite, which locks the whole database.
+    fn forUpdate(): Select {
+        return self.withLock("FOR UPDATE")
+    }
+
+    fn forShare(): Select {
+        return self.withLock("FOR SHARE")
+    }
+
+    fn skipLocked(): Select {
+        return self.withLock(self.lock + " SKIP LOCKED")
+    }
+
+    fn noWait(): Select {
+        return self.withLock(self.lock + " NOWAIT")
+    }
+
+    private fn withLock(clause: string): Select {
+        let n: Select = self.clone()
+        if (clause.startsWith(" ")) {
+            n.err = "skipLocked and noWait follow forUpdate or forShare"
+        }
+
+        n.lock = clause
+        return n
+    }
+
+    // Compound queries. ORDER BY, LIMIT and OFFSET on the first query apply
+    // to the whole result; the others may not have their own.
+    fn union(q: Select): Select {
+        return self.compound("UNION", q)
+    }
+
+    fn unionAll(q: Select): Select {
+        return self.compound("UNION ALL", q)
+    }
+
+    fn intersect(q: Select): Select {
+        return self.compound("INTERSECT", q)
+    }
+
+    fn except(q: Select): Select {
+        return self.compound("EXCEPT", q)
+    }
+
+    private fn compound(op: string, q: Select): Select {
+        let n: Select = self.clone()
+        n.compounds = Node.Cons(n.compounds, Node.Compound(op, q))
+        return n
+    }
+
+    // A common table expression: WITH name AS (q).
+    fn with(name: string, q: Select): Select {
+        let n: Select = self.clone()
+        n.ctes = Node.Cons(n.ctes, Node.Cte(name, q))
+        return n
+    }
+
+    fn withRecursive(name: string, q: Select): Select {
+        let n: Select = self.with(name, q)
+        n.recursive = true
+        return n
+    }
+
+    // A query counting the rows this one returns, for a page's total:
+    // SELECT COUNT(*) FROM (this without ORDER BY, LIMIT, OFFSET) AS "counted".
+    fn count(): Select {
+        let inner: Select = self.clone()
+        inner.orders = Node.Nil
+        inner.lim = Node.Nil
+        inner.off = Node.Nil
+        let outer: Select = blank()
+        outer.cols = Node.Cons(Node.Nil, Node.Call("COUNT", [Node.Star]))
+        outer.sources = Node.Cons(Node.Nil, Node.Alias(Node.Sub(inner), "counted"))
+        return outer
+    }
+
+    fn build(d: Dialect): Query throws QueryError {
+        let r: Renderer = newRenderer(d)
+        let sb = StringBuilder()
+        r.selectSql(sb, self.clone())
+        if (!r.err.isEmpty()) {
+            throw QueryError("" + r.err)
+        }
+
+        return r.finish(sb)
+    }
+}
+
+// ---- INSERT ----
+
+struct Insert {
+    private table: Node
+    private cols: Node
+    private rows: Node
+    private recCols: Node
+    private recVals: Node
+    private source: Node
+    private target: Node
+    private sets: Node
+    private returns: Node
+    private pending: int
+    private action: int
+
+    private fn clone(): Insert {
+        return Insert {
+            table: self.table,
+            cols: self.cols,
+            rows: self.rows,
+            pending: self.pending,
+            recCols: self.recCols,
+            recVals: self.recVals,
+            source: self.source,
+            target: self.target,
+            action: self.action,
+            sets: self.sets,
+            returns: self.returns
+        }
+    }
+
+    fn columns(names: string[]): Insert {
+        let n: Insert = self.clone()
+        foreach (names as name) {
+            n.cols = Node.Cons(n.cols, Node.Ident(name))
+        }
+
+        return n
+    }
+
+    // One row, its values in column order.
+    fn values(row: Expr[]): Insert {
+        let n: Insert = self.clone()
+        n.rows = Node.Cons(n.rows, Node.Tuple(nodesOf(row)))
+        n.pending = n.pending + 1
+        if (n.pending == ROW_CHUNK) {
+            n.rows = chunked(n.rows, ROW_CHUNK)
+            n.pending = 0
+        }
+
+        return n
+    }
+
+    // A column and its value, for a one-row insert written as a record.
+    fn set(column: string, value: Expr): Insert {
+        let n: Insert = self.clone()
+        n.recCols = Node.Cons(n.recCols, Node.Ident(column))
+        n.recVals = Node.Cons(n.recVals, value.node)
+        return n
+    }
+
+    // INSERT INTO t (cols) SELECT ...
+    fn fromSelect(q: Select): Insert {
+        let n: Insert = self.clone()
+        n.source = Node.Sub(q)
+        return n
+    }
+
+    // The unique columns an upsert conflicts on. MySQL has no conflict
+    // target, since ON DUPLICATE KEY applies to every unique key, so there
+    // it is ignored.
+    fn onConflict(columns: string[]): Insert {
+        let n: Insert = self.clone()
+        foreach (columns as c) {
+            n.target = Node.Cons(n.target, Node.Ident(c))
+        }
+
+        return n
+    }
+
+    // Skip a conflicting row: ON CONFLICT DO NOTHING, INSERT IGNORE on MySQL.
+    fn doNothing(): Insert {
+        let n: Insert = self.clone()
+        n.action = CONFLICT_NOTHING
+        return n
+    }
+
+    // Overwrite these columns of the existing row with the values inserted.
+    fn doUpdate(columns: string[]): Insert {
+        let n: Insert = self.clone()
+        n.action = CONFLICT_UPDATE
+        foreach (columns as c) {
+            n.sets = Node.Cons(n.sets, Node.Binary(Node.Ident(c), "=", Node.Excluded(c)))
+        }
+
+        return n
+    }
+
+    fn doUpdateSet(column: string, value: Expr): Insert {
+        let n: Insert = self.clone()
+        n.action = CONFLICT_UPDATE
+        n.sets = Node.Cons(n.sets, Node.Binary(Node.Ident(column), "=", value.node))
+        return n
+    }
+
+    // Not available on MySQL.
+    fn returning(columns: string[]): Insert {
+        let n: Insert = self.clone()
+        foreach (columns as c) {
+            n.returns = Node.Cons(n.returns, Node.Ident(c))
+        }
+
+        return n
+    }
+
+    fn build(d: Dialect): Query throws QueryError {
+        let r: Renderer = newRenderer(d)
+        let sb = StringBuilder()
+        r.insertSql(sb, self.clone())
+        if (!r.err.isEmpty()) {
+            throw QueryError("" + r.err)
+        }
+
+        return r.finish(sb)
+    }
+}
+
+const CONFLICT_NONE: int = 0
+const CONFLICT_NOTHING: int = 1
+const CONFLICT_UPDATE: int = 2
+
+// ---- UPDATE ----
+
+struct Update {
+    private table: Node
+    private sets: Node
+    private wheres: Node
+    private returns: Node
+    private everyRow: bool
+
+    private fn clone(): Update {
+        return Update {
+            table: self.table,
+            sets: self.sets,
+            wheres: self.wheres,
+            returns: self.returns,
+            everyRow: self.everyRow
+        }
+    }
+
+    fn set(column: string, value: Expr): Update {
+        let n: Update = self.clone()
+        n.sets = Node.Cons(n.sets, Node.Binary(Node.Ident(column), "=", value.node))
+        return n
+    }
+
+    fn where(cond: Expr): Update {
+        let n: Update = self.clone()
+        n.wheres = Node.Cons(n.wheres, cond.node)
+        return n
+    }
+
+    // An UPDATE with no where() is refused when built, since forgetting the
+    // condition rewrites the whole table. all() says that is what is meant.
+    fn all(): Update {
+        let n: Update = self.clone()
+        n.everyRow = true
+        return n
+    }
+
+    fn returning(columns: string[]): Update {
+        let n: Update = self.clone()
+        foreach (columns as c) {
+            n.returns = Node.Cons(n.returns, Node.Ident(c))
+        }
+
+        return n
+    }
+
+    fn build(d: Dialect): Query throws QueryError {
+        let r: Renderer = newRenderer(d)
+        let sb = StringBuilder()
+        r.updateSql(sb, self.clone())
+        if (!r.err.isEmpty()) {
+            throw QueryError("" + r.err)
+        }
+
+        return r.finish(sb)
+    }
+}
+
+// ---- DELETE ----
+
+struct Delete {
+    private table: Node
+    private wheres: Node
+    private returns: Node
+    private everyRow: bool
+
+    private fn clone(): Delete {
+        return Delete { table: self.table, wheres: self.wheres, returns: self.returns, everyRow: self.everyRow }
+    }
+
+    fn where(cond: Expr): Delete {
+        let n: Delete = self.clone()
+        n.wheres = Node.Cons(n.wheres, cond.node)
+        return n
+    }
+
+    // As for Update: a DELETE with no where() is refused unless all() says so.
+    fn all(): Delete {
+        let n: Delete = self.clone()
+        n.everyRow = true
+        return n
+    }
+
+    fn returning(columns: string[]): Delete {
+        let n: Delete = self.clone()
+        foreach (columns as c) {
+            n.returns = Node.Cons(n.returns, Node.Ident(c))
+        }
+
+        return n
+    }
+
+    fn build(d: Dialect): Query throws QueryError {
+        let r: Renderer = newRenderer(d)
+        let sb = StringBuilder()
+        r.deleteSql(sb, self.clone())
+        if (!r.err.isEmpty()) {
+            throw QueryError("" + r.err)
+        }
+
+        return r.finish(sb)
+    }
+}
+
+// ---- Starting a statement ----
+
+// These two set fields rather than calling the methods of the same name: in
+// a module, a method call named like one of the module's functions is
+// resolved to the function.
+fn from(table: string): Select {
+    let s: Select = blank()
+    s.sources = Node.Cons(Node.Nil, refOf(table))
+    return s
+}
+
+fn select(items: Expr[]): Select {
+    let s: Select = blank()
+    foreach (items as e) {
+        s.cols = Node.Cons(s.cols, e.node)
+    }
+
+    return s
+}
+
+fn insertInto(table: string): Insert {
+    return Insert {
+        table: refOf(table),
+        cols: Node.Nil,
+        rows: Node.Nil,
+        pending: 0,
+        recCols: Node.Nil,
+        recVals: Node.Nil,
+        source: Node.Nil,
+        target: Node.Nil,
+        action: CONFLICT_NONE,
+        sets: Node.Nil,
+        returns: Node.Nil
+    }
+}
+
+fn update(table: string): Update {
+    return Update { table: refOf(table), sets: Node.Nil, wheres: Node.Nil, returns: Node.Nil, everyRow: false }
+}
+
+fn deleteFrom(table: string): Delete {
+    return Delete { table: refOf(table), wheres: Node.Nil, returns: Node.Nil, everyRow: false }
+}
+
+private fn blank(): Select {
+    return Select {
+        ctes: Node.Nil,
+        recursive: false,
+        unique: false,
+        cols: Node.Nil,
+        sources: Node.Nil,
+        joins: Node.Nil,
+        wheres: Node.Nil,
+        groups: Node.Nil,
+        havings: Node.Nil,
+        orders: Node.Nil,
+        compounds: Node.Nil,
+        lim: Node.Nil,
+        off: Node.Nil,
+        lock: "",
+        err: ""
+    }
+}
+
+// ---- A built query ----
+
+// SQL and the values for its placeholders, in placeholder order. Immutable,
+// so one built at startup can be run from any number of threads.
+struct Query {
+    sql: string
+    args: Value[]
+    private names: string[]
+
+    // Whether it has param() placeholders, which bind() must fill.
+    fn hasParams(): bool {
+        foreach (self.names as name) {
+            if (!name.isEmpty()) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    // A fresh set of arguments for one run of the query.
+    fn bind(): Binder {
+        let vals: Value[] = []
+        let bound: bool[] = []
+        for (let i: int = 0; i < self.args.len(); i++) {
+            vals.push(self.args[i])
+            bound.push(self.names[i].isEmpty())
+        }
+
+        let problems: string[] = []
+        return Binder { names: self.names, vals: vals, bound: bound, problems: problems }
+    }
+}
+
+struct Binder {
+    private names: string[]
+    private vals: Value[]
+    private bound: bool[]
+    // An array pushed into rather than a string field reassigned: a field
+    // written by a method on a temporary leaks if a later call in the same
+    // chain throws, and q.bind().setInt(..).args() is that chain.
+    private problems: string[]
+
+    fn setInt(name: string, v: int): &Binder {
+        return self.put(name, Value.Int(num.toLong(v)))
+    }
+
+    fn setLong(name: string, v: long): &Binder {
+        return self.put(name, Value.Int(v))
+    }
+
+    fn setReal(name: string, v: double): &Binder {
+        return self.put(name, Value.Real(v))
+    }
+
+    fn setText(name: string, v: string): &Binder {
+        return self.put(name, Value.Text(v))
+    }
+
+    fn setBool(name: string, v: bool): &Binder {
+        return self.put(name, Value.Bool(v))
+    }
+
+    fn setNull(name: string): &Binder {
+        return self.put(name, Value.Null)
+    }
+
+    private fn put(name: string, v: Value): &Binder {
+        // A field cannot be indexed on the left of =, so write through locals;
+        // the arrays are this binder's own, made by Query.bind.
+        let vals: Value[] = self.vals
+        let bound: bool[] = self.bound
+        let hit: bool = false
+        for (let i: int = 0; i < self.names.len(); i++) {
+            if (self.names[i] == name) {
+                vals[i] = v
+                bound[i] = true
+                hit = true
+            }
+        }
+
+        if (!hit) {
+            let problems: string[] = self.problems
+            problems.push("the query has no parameter named '" + name + "'")
+        }
+
+        return self
+    }
+
+    // The arguments, once every parameter has a value.
+    fn args(): Value[] throws QueryError {
+        let problems: string[] = self.problems
+        if (problems.len() > 0) {
+            throw QueryError("" + problems[0])
+        }
+
+        for (let i: int = 0; i < self.bound.len(); i++) {
+            if (!self.bound[i]) {
+                throw QueryError("parameter '" + self.names[i] + "' has no value")
+            }
+        }
+
+        return self.vals
+    }
+}
+
+// ---- Rendering ----
+
+struct Renderer {
+    d: Dialect
+    args: Value[]
+    names: string[]
+    slots: map[string, int]
+    err: string
+
+    // Rendering records the first error and unwinds by returning, and build
+    // throws it from its own frame: a throw out of a method call on a struct
+    // local leaks that local's fields.
+    fn fail(message: string): void {
+        if (self.err.isEmpty()) {
+            self.err = message
+        }
+    }
+
+    fn finish(sb: StringBuilder): Query {
+        return Query { sql: sb.toString(), args: self.args, names: self.names }
+    }
+
+    fn placeholder(sb: StringBuilder): void {
+        if (self.d == Dialect.Postgres) {
+            sb.append("$")
+            sb.append(self.args.len())
+        } else {
+            sb.append("?")
+        }
+    }
+
+    fn value(sb: StringBuilder, v: Value): void {
+        switch (v) {
+            case Value.Null: {
+                sb.append("NULL")
+            }
+            case Value.Bool(b): {
+                if (self.d == Dialect.SQLite) {
+                    if (b) {
+                        sb.append("1")
+                    } else {
+                        sb.append("0")
+                    }
+                } else if (b) {
+                    sb.append("TRUE")
+                } else {
+                    sb.append("FALSE")
+                }
+            }
+            default: {
+                self.args.push(v)
+                self.names.push("")
+                self.placeholder(sb)
+            }
+        }
+    }
+
+    // On Postgres a parameter used twice is one placeholder, $n, written
+    // twice; with ? each use is its own, and bind fills them all.
+    fn param(sb: StringBuilder, name: string): void {
+        if (self.d == Dialect.Postgres && self.slots.has(name)) {
+            sb.append("$")
+            sb.append(self.slots.get(name))
+            return
+        }
+
+        self.args.push(Value.Null)
+        self.names.push(name)
+        self.slots.set(name, self.args.len())
+        self.placeholder(sb)
+    }
+
+    // One name, quoted whole, its quote character doubled inside it.
+    fn quoted(sb: StringBuilder, name: string): void {
+        if (name.isEmpty()) {
+            self.fail("an identifier is empty")
+            return
+        }
+
+        let q: string = "\""
+        if (self.d == Dialect.MySQL) {
+            q = "`"
+        }
+
+        sb.append(q)
+        if (name.contains(q)) {
+            sb.append(name.replace(q, q + q))
+        } else {
+            sb.append(name)
+        }
+
+        sb.append(q)
+    }
+
+    // A dotted name, each part quoted; a final * is left bare. One pass over
+    // the characters, with no split and no strings made.
+    fn ident(sb: StringBuilder, name: string): void {
+        if (name == "*") {
+            sb.append("*")
+            return
+        }
+
+        if (!name.contains(".")) {
+            self.quoted(sb, name)
+            return
+        }
+
+        let q: char = '"'
+        if (self.d == Dialect.MySQL) {
+            q = '`'
+        }
+
+        let start: int = 0
+        for (let i: int = 0; i <= name.len(); i++) {
+            if (i == name.len() || name.charAt(i) == '.') {
+                if (i == start) {
+                    self.fail("'" + name + "' has an empty part")
+                    return
+                }
+
+                if (start > 0) {
+                    sb.append(".")
+                }
+
+                if (start > 0 && i == name.len() && i - start == 1 && name.charAt(start) == '*') {
+                    sb.append("*")
+                } else {
+                    sb.append(q)
+                    for (let j: int = start; j < i; j++) {
+                        let c: char = name.charAt(j)
+                        if (c == q) {
+                            sb.append(q)
+                        }
+
+                        sb.append(c)
+                    }
+
+                    sb.append(q)
+                }
+
+                start = i + 1
+            }
+        }
+    }
+
+    fn list(sb: StringBuilder, items: Node[], sep: string): void {
+        for (let i: int = 0; i < items.len(); i++) {
+            if (i > 0) {
+                sb.append(sep)
+            }
+
+            self.node(sb, items[i])
+        }
+    }
+
+    // A clause list in the order it was built. The newest item is outermost,
+    // so this recurses to the oldest first; clause lists are short, and the
+    // one list that can be long, INSERT rows, goes through listOf.
+    fn seq(sb: StringBuilder, list: Node, sep: string): void {
+        switch (list) {
+            case Node.Cons(rest, item): {
+                if (!isNil(rest)) {
+                    self.seq(sb, rest, sep)
+                    sb.append(sep)
+                }
+
+                self.node(sb, item)
+            }
+            default: {}
+        }
+    }
+
+    // Conditions joined with AND, as a WHERE or HAVING list. One condition
+    // is the whole clause and needs no parentheses.
+    fn conds(sb: StringBuilder, list: Node): void {
+        switch (list) {
+            case Node.Cons(rest, item): {
+                if (isNil(rest)) {
+                    self.node(sb, item)
+                } else {
+                    self.andSeq(sb, list)
+                }
+            }
+            default: {}
+        }
+    }
+
+    fn andSeq(sb: StringBuilder, list: Node): void {
+        switch (list) {
+            case Node.Cons(rest, item): {
+                if (!isNil(rest)) {
+                    self.andSeq(sb, rest)
+                    sb.append(" AND ")
+                }
+
+                self.predicate(sb, item)
+            }
+            default: {}
+        }
+    }
+
+    // A condition among others joined by AND or OR: parenthesised when it is
+    // itself a join, or hand-written SQL whose operators are unknown.
+    fn predicate(sb: StringBuilder, n: Node): void {
+        switch (n) {
+            case Node.Raw(_, _): {
+                self.wrapped(sb, n)
+            }
+            case Node.Many(_, items): {
+                if (items.len() == 1) {
+                    self.predicate(sb, items[0])
+                } else if (items.len() == 0) {
+                    self.node(sb, n)
+                } else {
+                    self.wrapped(sb, n)
+                }
+            }
+            default: {
+                self.node(sb, n)
+            }
+        }
+    }
+
+    // An operand of an operator: parenthesised unless it is atomic.
+    fn operand(sb: StringBuilder, n: Node): void {
+        switch (n) {
+            case Node.Binary(_, _, _): {
+                self.wrapped(sb, n)
+            }
+            case Node.Prefix(_, _): {
+                self.wrapped(sb, n)
+            }
+            case Node.Suffix(_, _): {
+                self.wrapped(sb, n)
+            }
+            case Node.InList(_, _, _): {
+                self.wrapped(sb, n)
+            }
+            case Node.Between(_, _, _, _): {
+                self.wrapped(sb, n)
+            }
+            case Node.Raw(_, _): {
+                self.wrapped(sb, n)
+            }
+            case Node.Concat(_): {
+                if (self.d == Dialect.MySQL) {
+                    self.node(sb, n)
+                } else {
+                    self.wrapped(sb, n)
+                }
+            }
+            case Node.Many(_, items): {
+                if (items.len() == 1) {
+                    self.operand(sb, items[0])
+                } else {
+                    self.wrapped(sb, n)
+                }
+            }
+            default: {
+                self.node(sb, n)
+            }
+        }
+    }
+
+    fn wrapped(sb: StringBuilder, n: Node): void {
+        sb.append("(")
+        self.node(sb, n)
+        sb.append(")")
+    }
+
+    fn node(sb: StringBuilder, n: Node): void {
+        switch (n) {
+            case Node.Ident(name): {
+                self.ident(sb, name)
+            }
+            case Node.Star: {
+                sb.append("*")
+            }
+            case Node.Lit(v): {
+                self.value(sb, v)
+            }
+            case Node.Param(name): {
+                self.param(sb, name)
+            }
+            case Node.Raw(sql, holes): {
+                self.raw(sb, sql, holes)
+            }
+            case Node.Prefix(op, a): {
+                sb.append(op)
+                sb.append(" ")
+                self.operand(sb, a)
+            }
+            case Node.Suffix(a, op): {
+                self.operand(sb, a)
+                sb.append(" ")
+                sb.append(op)
+            }
+            case Node.Binary(a, op, b): {
+                self.operand(sb, a)
+                sb.append(" ")
+                if (self.d != Dialect.Postgres && op == "ILIKE") {
+                    sb.append("LIKE")
+                } else if (self.d != Dialect.Postgres && op == "NOT ILIKE") {
+                    sb.append("NOT LIKE")
+                } else {
+                    sb.append(op)
+                }
+
+                sb.append(" ")
+                self.operand(sb, b)
+            }
+            case Node.Many(op, items): {
+                if (items.len() == 0) {
+                    if (op == "AND") {
+                        sb.append("1 = 1")
+                    } else {
+                        sb.append("1 = 0")
+                    }
+                } else {
+                    for (let i: int = 0; i < items.len(); i++) {
+                        if (i > 0) {
+                            sb.append(" ")
+                            sb.append(op)
+                            sb.append(" ")
+                        }
+
+                        self.predicate(sb, items[i])
+                    }
+                }
+            }
+            case Node.Tuple(items): {
+                sb.append("(")
+                self.list(sb, items, ", ")
+                sb.append(")")
+            }
+            case Node.Call(name, callArgs): {
+                if (!validName(name)) {
+                    self.fail("'" + name + "' is not a function name")
+                    return
+                }
+
+                sb.append(name)
+                sb.append("(")
+                self.list(sb, callArgs, ", ")
+                sb.append(")")
+            }
+            case Node.Alias(a, name): {
+                self.node(sb, a)
+                sb.append(" AS ")
+                self.quoted(sb, name)
+            }
+            case Node.Sub(q): {
+                sb.append("(")
+                self.selectSql(sb, q)
+                sb.append(")")
+            }
+            case Node.InList(a, op, items): {
+                // An empty list matches nothing, and IN () is not SQL.
+                if (items.len() == 0) {
+                    if (op == "IN") {
+                        sb.append("1 = 0")
+                    } else {
+                        sb.append("1 = 1")
+                    }
+                } else {
+                    self.operand(sb, a)
+                    sb.append(" ")
+                    sb.append(op)
+                    sb.append(" (")
+                    self.list(sb, items, ", ")
+                    sb.append(")")
+                }
+            }
+            case Node.Between(a, op, lo, hi): {
+                self.operand(sb, a)
+                sb.append(" ")
+                sb.append(op)
+                sb.append(" ")
+                self.operand(sb, lo)
+                sb.append(" AND ")
+                self.operand(sb, hi)
+            }
+            case Node.Concat(items): {
+                if (self.d == Dialect.MySQL) {
+                    sb.append("CONCAT(")
+                    self.list(sb, items, ", ")
+                    sb.append(")")
+                } else {
+                    for (let i: int = 0; i < items.len(); i++) {
+                        if (i > 0) {
+                            sb.append(" || ")
+                        }
+
+                        self.operand(sb, items[i])
+                    }
+                }
+            }
+            case Node.Cast(a, sqlType): {
+                if (!validType(sqlType)) {
+                    self.fail("'" + sqlType + "' is not a type name")
+                    return
+                }
+
+                sb.append("CAST(")
+                self.node(sb, a)
+                sb.append(" AS ")
+                sb.append(sqlType)
+                sb.append(")")
+            }
+            case Node.Case(whens, thens): {
+                sb.append("CASE")
+                for (let i: int = 0; i < whens.len(); i++) {
+                    sb.append(" WHEN ")
+                    self.node(sb, whens[i])
+                    sb.append(" THEN ")
+                    self.node(sb, thens[i])
+                }
+
+                if (thens.len() > whens.len()) {
+                    sb.append(" ELSE ")
+                    self.node(sb, thens[whens.len()])
+                }
+
+                sb.append(" END")
+            }
+            case Node.Over(f, parts, orders): {
+                self.node(sb, f)
+                sb.append(" OVER (")
+                if (parts.len() > 0) {
+                    sb.append("PARTITION BY ")
+                    self.list(sb, parts, ", ")
+                }
+
+                if (orders.len() > 0) {
+                    if (parts.len() > 0) {
+                        sb.append(" ")
+                    }
+
+                    sb.append("ORDER BY ")
+                    self.list(sb, orders, ", ")
+                }
+
+                sb.append(")")
+            }
+            case Node.Excluded(column): {
+                if (self.d == Dialect.MySQL) {
+                    sb.append("VALUES(")
+                    self.ident(sb, column)
+                    sb.append(")")
+                } else {
+                    sb.append("EXCLUDED.")
+                    self.ident(sb, column)
+                }
+            }
+            case Node.Bad(message): {
+                self.fail(message)
+                return
+            }
+            default: {
+                self.fail("internal: a clause node outside its clause")
+                return
+            }
+        }
+    }
+
+    // Hand-written SQL: each ? is the next argument, ?? a literal ?.
+    fn raw(sb: StringBuilder, sql: string, holes: Node[]): void {
+        if (holes.len() == 0 && !sql.contains("?")) {
+            sb.append(sql)
+            return
+        }
+
+        let next: int = 0
+        let start: int = 0
+        let i: int = 0
+        while (i < sql.len()) {
+            if (sql.charAt(i) == '?') {
+                sb.append(sql.substring(start, i))
+                if (i + 1 < sql.len() && sql.charAt(i + 1) == '?') {
+                    sb.append("?")
+                    i = i + 2
+                } else {
+                    if (next >= holes.len()) {
+                        self.fail("more ? than arguments in: " + sql)
+                        return
+                    }
+
+                    self.node(sb, holes[next])
+                    next = next + 1
+                    i = i + 1
+                }
+
+                start = i
+            } else {
+                i = i + 1
+            }
+        }
+
+        sb.append(sql.substring(start, sql.len()))
+        if (next < holes.len()) {
+            self.fail("fewer ? than arguments in: " + sql)
+            return
+        }
+    }
+
+    fn selectSql(sb: StringBuilder, s: Select): void {
+        if (!s.err.isEmpty()) {
+            self.fail(s.err)
+            return
+        }
+
+        if (!isNil(s.ctes)) {
+            sb.append("WITH ")
+            if (s.recursive) {
+                sb.append("RECURSIVE ")
+            }
+
+            self.ctes(sb, s.ctes)
+            sb.append(" ")
+        }
+
+        self.selectCore(sb, s)
+        self.compounds(sb, s.compounds)
+        if (!isNil(s.orders)) {
+            sb.append(" ORDER BY ")
+            self.seq(sb, s.orders, ", ")
+        }
+
+        let hasLimit: bool = !isNil(s.lim)
+        let hasOffset: bool = !isNil(s.off)
+        if (hasLimit) {
+            sb.append(" LIMIT ")
+            self.node(sb, s.lim)
+        } else if (hasOffset && self.d == Dialect.MySQL) {
+            // Neither MySQL nor SQLite takes OFFSET without LIMIT.
+            sb.append(" LIMIT 18446744073709551615")
+        } else if (hasOffset && self.d == Dialect.SQLite) {
+            sb.append(" LIMIT -1")
+        }
+
+        if (hasOffset) {
+            sb.append(" OFFSET ")
+            self.node(sb, s.off)
+        }
+
+        if (!s.lock.isEmpty()) {
+            if (self.d == Dialect.SQLite) {
+                self.fail("SQLite has no row locks: " + s.lock)
+                return
+            }
+
+            sb.append(" ")
+            sb.append(s.lock)
+        }
+    }
+
+    fn ctes(sb: StringBuilder, list: Node): void {
+        switch (list) {
+            case Node.Cons(rest, item): {
+                if (!isNil(rest)) {
+                    self.ctes(sb, rest)
+                    sb.append(", ")
+                }
+
+                switch (item) {
+                    case Node.Cte(name, q): {
+                        self.quoted(sb, name)
+                        sb.append(" AS (")
+                        self.selectSql(sb, q)
+                        sb.append(")")
+                    }
+                    default: {}
+                }
+            }
+            default: {}
+        }
+    }
+
+    fn compounds(sb: StringBuilder, list: Node): void {
+        switch (list) {
+            case Node.Cons(rest, item): {
+                self.compounds(sb, rest)
+                switch (item) {
+                    case Node.Compound(op, q): {
+                        if (!isNil(q.orders) || !isNil(q.lim) || !isNil(q.off) || !isNil(q.ctes)) {
+                            self.fail(
+                                op +
+                                " takes a query without its own ORDER BY, LIMIT, OFFSET or WITH; put them on the first"
+                            )
+                            return
+                        }
+
+                        if (!q.err.isEmpty()) {
+                            self.fail(q.err)
+                            return
+                        }
+
+                        sb.append(" ")
+                        sb.append(op)
+                        sb.append(" ")
+                        self.selectCore(sb, q)
+                        self.compounds(sb, q.compounds)
+                    }
+                    default: {}
+                }
+            }
+            default: {}
+        }
+    }
+
+    fn selectCore(sb: StringBuilder, s: Select): void {
+        sb.append("SELECT ")
+        if (s.unique) {
+            sb.append("DISTINCT ")
+        }
+
+        if (isNil(s.cols)) {
+            sb.append("*")
+        } else {
+            self.seq(sb, s.cols, ", ")
+        }
+
+        if (!isNil(s.sources)) {
+            sb.append(" FROM ")
+            self.seq(sb, s.sources, ", ")
+        }
+
+        self.joins(sb, s.joins)
+        if (!isNil(s.wheres)) {
+            sb.append(" WHERE ")
+            self.conds(sb, s.wheres)
+        }
+
+        if (!isNil(s.groups)) {
+            sb.append(" GROUP BY ")
+            self.seq(sb, s.groups, ", ")
+        }
+
+        if (!isNil(s.havings)) {
+            sb.append(" HAVING ")
+            self.conds(sb, s.havings)
+        }
+    }
+
+    fn joins(sb: StringBuilder, list: Node): void {
+        switch (list) {
+            case Node.Cons(rest, item): {
+                self.joins(sb, rest)
+                switch (item) {
+                    case Node.Join(kind, source, on): {
+                        if (kind == "FULL JOIN" && self.d == Dialect.MySQL) {
+                            self.fail("MySQL has no FULL JOIN")
+                            return
+                        }
+
+                        sb.append(" ")
+                        sb.append(kind)
+                        sb.append(" ")
+                        self.node(sb, source)
+                        if (!isNil(on)) {
+                            sb.append(" ON ")
+                            self.node(sb, on)
+                        }
+                    }
+                    case Node.Using(kind, source, columns): {
+                        sb.append(" ")
+                        sb.append(kind)
+                        sb.append(" ")
+                        self.node(sb, source)
+                        sb.append(" USING (")
+                        for (let i: int = 0; i < columns.len(); i++) {
+                            if (i > 0) {
+                                sb.append(", ")
+                            }
+
+                            self.quoted(sb, columns[i])
+                        }
+
+                        sb.append(")")
+                    }
+                    default: {}
+                }
+            }
+            default: {}
+        }
+    }
+
+    fn insertSql(sb: StringBuilder, ins: Insert): void {
+        let cols: Node[] = listOf(ins.cols)
+        let rows: Node[] = listOf(ins.rows)
+        let recCols: Node[] = listOf(ins.recCols)
+        if (recCols.len() > 0) {
+            if (cols.len() > 0 || rows.len() > 0 || !isNil(ins.source)) {
+                self.fail("set() makes the row; it cannot be mixed with columns(), values() or fromSelect()")
+                return
+            }
+
+            cols = recCols
+            rows = [Node.Tuple(listOf(ins.recVals))]
+        }
+
+        if (ins.action == CONFLICT_NOTHING && self.d == Dialect.MySQL) {
+            sb.append("INSERT IGNORE INTO ")
+        } else {
+            sb.append("INSERT INTO ")
+        }
+
+        self.node(sb, ins.table)
+        if (cols.len() > 0) {
+            sb.append(" (")
+            self.list(sb, cols, ", ")
+            sb.append(")")
+        }
+
+        if (!isNil(ins.source)) {
+            if (rows.len() > 0) {
+                self.fail("an INSERT takes values() or fromSelect(), not both")
+                return
+            }
+
+            switch (ins.source) {
+                case Node.Sub(q): {
+                    if (self.d == Dialect.SQLite && ins.action != CONFLICT_NONE) {
+                        // SQLite reads ON CONFLICT after a bare SELECT as part
+                        // of a join; a WHERE ahead of it settles that.
+                        sb.append(" SELECT * FROM (")
+                        self.selectSql(sb, q)
+                        sb.append(") WHERE true")
+                    } else {
+                        sb.append(" ")
+                        self.selectSql(sb, q)
+                    }
+                }
+                default: {}
+            }
+        } else {
+            if (rows.len() == 0) {
+                self.fail("an INSERT needs values(), set() or fromSelect()")
+                return
+            }
+
+            sb.append(" VALUES ")
+            for (let i: int = 0; i < rows.len(); i++) {
+                if (i > 0) {
+                    sb.append(", ")
+                }
+
+                switch (rows[i]) {
+                    case Node.Tuple(items): {
+                        if (cols.len() > 0 && items.len() != cols.len()) {
+                            self.fail("row ${i + 1} has ${items.len()} values for ${cols.len()} columns")
+                            return
+                        }
+                    }
+                    default: {}
+                }
+
+                self.node(sb, rows[i])
+            }
+        }
+
+        let hasTarget: bool = !isNil(ins.target)
+        if (ins.action == CONFLICT_NONE && hasTarget) {
+            self.fail("onConflict() needs doNothing() or doUpdate()")
+            return
+        }
+
+        if (ins.action == CONFLICT_UPDATE) {
+            if (self.d == Dialect.MySQL) {
+                sb.append(" ON DUPLICATE KEY UPDATE ")
+            } else {
+                if (!hasTarget) {
+                    self.fail("doUpdate() needs onConflict(columns) to name the unique key")
+                    return
+                }
+
+                sb.append(" ON CONFLICT (")
+                self.seq(sb, ins.target, ", ")
+                sb.append(") DO UPDATE SET ")
+            }
+
+            self.seq(sb, ins.sets, ", ")
+        } else if (ins.action == CONFLICT_NOTHING && self.d != Dialect.MySQL) {
+            sb.append(" ON CONFLICT")
+            if (hasTarget) {
+                sb.append(" (")
+                self.seq(sb, ins.target, ", ")
+                sb.append(")")
+            }
+
+            sb.append(" DO NOTHING")
+        }
+
+        self.returning(sb, ins.returns)
+    }
+
+    fn updateSql(sb: StringBuilder, u: Update): void {
+        if (isNil(u.sets)) {
+            self.fail("an UPDATE needs at least one set()")
+            return
+        }
+
+        if (isNil(u.wheres) && !u.everyRow) {
+            self.fail("an UPDATE without where() changes every row; call all() if that is meant")
+            return
+        }
+
+        sb.append("UPDATE ")
+        self.node(sb, u.table)
+        sb.append(" SET ")
+        self.seq(sb, u.sets, ", ")
+        if (!isNil(u.wheres)) {
+            sb.append(" WHERE ")
+            self.conds(sb, u.wheres)
+        }
+
+        self.returning(sb, u.returns)
+    }
+
+    fn deleteSql(sb: StringBuilder, del: Delete): void {
+        if (isNil(del.wheres) && !del.everyRow) {
+            self.fail("a DELETE without where() removes every row; call all() if that is meant")
+            return
+        }
+
+        sb.append("DELETE FROM ")
+        self.node(sb, del.table)
+        if (!isNil(del.wheres)) {
+            sb.append(" WHERE ")
+            self.conds(sb, del.wheres)
+        }
+
+        self.returning(sb, del.returns)
+    }
+
+    fn returning(sb: StringBuilder, returns: Node): void {
+        if (isNil(returns)) {
+            return
+        }
+
+        if (self.d == Dialect.MySQL) {
+            self.fail("MySQL has no RETURNING")
+            return
+        }
+
+        sb.append(" RETURNING ")
+        self.seq(sb, returns, ", ")
+    }
+}
+
+private fn newRenderer(d: Dialect): Renderer {
+    let slots: map[string, int] = {}
+    return Renderer { d: d, args: [], names: [], slots: slots, err: "" }
+}
+
+// ---- Helpers ----
+
+private fn wrap(n: Node): Expr {
+    return Expr { node: n }
+}
+
+private fn nodesOf(items: Expr[]): Node[] {
+    let out: Node[] = []
+    foreach (items as e) {
+        out.push(e.node)
+    }
+
+    return out
+}
+
+private fn noNodes(): Node[] {
+    let out: Node[] = []
+    return out
+}
+
+private fn copyNodes(items: Node[]): Node[] {
+    let out: Node[] = []
+    foreach (items as n) {
+        out.push(n)
+    }
+
+    return out
+}
+
+private fn isNil(n: Node): bool {
+    switch (n) {
+        case Node.Nil: {
+            return true
+        }
+        default: {
+            return false
+        }
+    }
+}
+
+private fn isNullLit(n: Node): bool {
+    switch (n) {
+        case Node.Lit(v): {
+            switch (v) {
+                case Value.Null: {
+                    return true
+                }
+                default: {
+                    return false
+                }
+            }
+        }
+        default: {
+            return false
+        }
+    }
+}
+
+// a AND b, flattening either side that is already an AND.
+private fn joined(op: string, a: Node, b: Node): Node {
+    let items: Node[] = []
+    flattenInto(items, op, a)
+    flattenInto(items, op, b)
+    return Node.Many(op, items)
+}
+
+private fn flattenInto(items: Node[], op: string, n: Node): void {
+    switch (n) {
+        case Node.Many(o, xs): {
+            if (o == op) {
+                foreach (xs as x) {
+                    items.push(x)
+                }
+
+                return
+            }
+        }
+        default: {}
+    }
+
+    items.push(n)
+}
+
+// A clause list in the order it was built, chunks expanded. The walk is a
+// loop rather than recursion, so a long list costs no stack.
+private fn listOf(list: Node): Node[] {
+    let rev: Node[] = []
+    let cur: Node = list
+    let going: bool = true
+    while (going) {
+        switch (cur) {
+            case Node.Cons(rest, item): {
+                rev.push(item)
+                cur = rest
+            }
+            default: {
+                going = false
+            }
+        }
+    }
+
+    let out: Node[] = []
+    for (let i: int = rev.len() - 1; i >= 0; i--) {
+        switch (rev[i]) {
+            case Node.Chunk(xs): {
+                foreach (xs as x) {
+                    out.push(x)
+                }
+            }
+            default: {
+                out.push(rev[i])
+            }
+        }
+    }
+
+    return out
+}
+
+// Folds the newest k items of a list into one Chunk node.
+private fn chunked(list: Node, k: int): Node {
+    let items: Node[] = []
+    let cur: Node = list
+    let taken: int = 0
+    while (taken < k) {
+        switch (cur) {
+            case Node.Cons(rest, item): {
+                items.push(item)
+                cur = rest
+                taken = taken + 1
+            }
+            default: {
+                taken = k
+            }
+        }
+    }
+
+    items.reverse()
+    return Node.Cons(cur, Node.Chunk(items))
+}
+
+// "users", "users u" or "users AS u".
+private fn refOf(spec: string): Node {
+    let s: string = spec.trim()
+    if (!s.contains(" ")) {
+        return Node.Ident(s)
+    }
+
+    let words: string[] = wordsOf(s)
+    if (words.len() == 2) {
+        return Node.Alias(Node.Ident(words[0]), words[1])
+    }
+
+    if (words.len() == 3 && words[1].toUpper() == "AS") {
+        return Node.Alias(Node.Ident(words[0]), words[2])
+    }
+
+    return Node.Bad("cannot read '" + spec + "' as a name and an alias")
+}
+
+// "name", "name ASC" or "name DESC".
+private fn orderOf(spec: string): Node {
+    let s: string = spec.trim()
+    if (!s.contains(" ")) {
+        return Node.Ident(s)
+    }
+
+    let words: string[] = wordsOf(s)
+    if (words.len() == 2) {
+        let dir: string = words[1].toUpper()
+        if (dir == "ASC" || dir == "DESC") {
+            return Node.Suffix(Node.Ident(words[0]), dir)
+        }
+    }
+
+    return Node.Bad("cannot read '" + spec + "' as a column and ASC or DESC")
+}
+
+private fn wordsOf(s: string): string[] {
+    let words: string[] = []
+    foreach (s.split(" ") as w) {
+        if (!w.isEmpty()) {
+            words.push(w)
+        }
+    }
+
+    return words
+}
+
+// createdAt -> created_at
+private fn snakeCase(name: string): string {
+    let sb = StringBuilder()
+    for (let i: int = 0; i < name.len(); i++) {
+        let c: char = name.charAt(i)
+        if (c >= 'A' && c <= 'Z') {
+            if (i > 0) {
+                sb.append("_")
+            }
+
+            sb.append(name.substring(i, i + 1).toLower())
+        } else {
+            sb.append(c)
+        }
+    }
+
+    return sb.toString()
+}
+
+private fn isWordChar(c: char): bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+private fn validName(s: string): bool {
+    if (s.isEmpty()) {
+        return false
+    }
+
+    for (let i: int = 0; i < s.len(); i++) {
+        let c: char = s.charAt(i)
+        if (!isWordChar(c) && c != '.') {
+            return false
+        }
+    }
+
+    return true
+}
+
+private fn validType(s: string): bool {
+    if (s.isEmpty()) {
+        return false
+    }
+
+    for (let i: int = 0; i < s.len(); i++) {
+        let c: char = s.charAt(i)
+        if (!isWordChar(c) && c != ' ' && c != '(' && c != ')' && c != ',') {
+            return false
+        }
+    }
+
+    return true
+}

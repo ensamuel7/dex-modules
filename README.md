@@ -11,9 +11,10 @@ released without a new compiler.
 |---|---|---|---|
 | `sqlite/` | `github.com/ensamuel7/dex-modules/sqlite` | libsqlite3 | `brew install sqlite` / `apt install libsqlite3-dev` |
 | `redis/` | `github.com/ensamuel7/dex-modules/redis` | hiredis | `brew install hiredis` / `apt install libhiredis-dev` |
+| `dexqu/` | `github.com/ensamuel7/dex-modules/dexqu` | nothing: a SQL query builder in pure Dex | |
 | `example/` | `github.com/ensamuel7/dex-modules/example` | uses both | |
 
-Both libraries find their C library through `pkg-config`, so `pkg-config` has
+The two C wrappers find their library through `pkg-config`, so `pkg-config` has
 to be installed too.
 
 ## Layout of a library
@@ -79,6 +80,7 @@ checkout, and deletes the line once the change is released.
 ```sh
 cd sqlite  && dex run sqlite_test.dx
 cd redis   && dex run redis_test.dx
+cd dexqu   && dex run dexqu_test.dx && dex run sqldb_test.dx
 cd example && dex run main.dx
 ```
 
@@ -88,7 +90,7 @@ both.
 ## Releasing
 
 Each module is versioned on its own, with a tag that starts with its folder:
-`sqlite/v0.1.0`, `redis/v0.1.0`. A fix to one does not release the other.
+`sqlite/v0.1.0`, `redis/v0.1.0`, `dexqu/v0.1.0`. A fix to one does not release the other.
 
 ```sh
 git tag redis/v0.2.0

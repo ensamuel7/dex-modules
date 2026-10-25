@@ -1,0 +1,61 @@
+// Runs dexqu queries through the standard library's db module.
+//
+// A file of its own so that a program which only builds SQL does not import
+// db, and with it every database driver the machine has.
+
+import "db"
+import "dexqu"
+
+// A prepared statement for the query, its arguments bound. Step it with
+// db.next, read with db.col or db.fill, and release it with db.finalize.
+fn query(conn: int, q: dexqu.Query): int throws dexqu.QueryError {
+    if (q.hasParams()) {
+        throw dexqu.QueryError("the query has param()s: run it with prepare(conn, q.sql, q.bind()...args())")
+    }
+
+    return prepare(conn, q.sql, q.args)
+}
+
+// Runs a statement that returns no rows.
+fn exec(conn: int, q: dexqu.Query): void throws dexqu.QueryError {
+    let st: int = query(conn, q)
+    db.step(st)
+    db.finalize(st)
+}
+
+fn prepare(conn: int, sql: string, args: dexqu.Value[]): int throws dexqu.QueryError {
+    let st: int = db.prepare(conn, sql)
+    if (st < 0) {
+        throw dexqu.QueryError("could not prepare: " + sql)
+    }
+
+    for (let i: int = 0; i < args.len(); i++) {
+        let at: int = i + 1
+        switch (args[i]) {
+            case Value.Int(v): {
+                db.bindLong(st, at, v)
+            }
+            case Value.Real(v): {
+                db.bindDouble(st, at, v)
+            }
+            case Value.Text(v): {
+                db.bindStr(st, at, v)
+            }
+            case Value.Bool(v): {
+                if (v) {
+                    db.bindInt(st, at, 1)
+                } else {
+                    db.bindInt(st, at, 0)
+                }
+            }
+            case Value.Null: {
+                // db has no way to bind NULL. A literal sqlNull() is written
+                // into the SQL instead, so this is only a param set to null.
+                db.finalize(st)
+                throw dexqu.QueryError("db cannot bind NULL, as parameter ${at} of: " + sql)
+            }
+        }
+    }
+
+    return st
+}

@@ -25,7 +25,7 @@ let built: q.Query = active.build(q.Dialect.Postgres)
 `build` throws `q.QueryError` for a query that cannot be written: a feature the
 dialect lacks, an UPDATE with no condition, a malformed name.
 
-Needs **dex 0.9.14 or later**, which `dex.mod` records as `dex 0.9.14`. A
+Needs **dex 0.9.16 or later**, which `dex.mod` records as `dex 0.9.16`. A
 compiler that reads that directive refuses an older version at the import, with
 an error that says to upgrade. One from before the directive existed fails
 inside `dexqu.dx` instead, with errors such as `undefined function 'noNodes'`.

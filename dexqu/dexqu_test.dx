@@ -1,0 +1,573 @@
+import "fmt"
+import "reflect"
+import "github.com/ensamuel7/dex-modules/dexqu" as "q"
+
+const PG: q.Dialect = q.Dialect.Postgres
+const MY: q.Dialect = q.Dialect.MySQL
+const LITE: q.Dialect = q.Dialect.SQLite
+
+struct Account {
+    id: long
+    fullName: string
+    email: string `db:"lower(email)"`
+}
+
+// Each helper renders a builder and hands back its SQL, or "error: " and the
+// message, so a case is one line and failures are compared like any output.
+fn sel(s: q.Select, d: q.Dialect): string {
+    try {
+        return s.build(d).sql
+    } catch (e: q.QueryError) {
+        return "error: " + e.message
+    }
+}
+
+fn ins(s: q.Insert, d: q.Dialect): string {
+    try {
+        return s.build(d).sql
+    } catch (e: q.QueryError) {
+        return "error: " + e.message
+    }
+}
+
+fn upd(s: q.Update, d: q.Dialect): string {
+    try {
+        return s.build(d).sql
+    } catch (e: q.QueryError) {
+        return "error: " + e.message
+    }
+}
+
+fn del(s: q.Delete, d: q.Dialect): string {
+    try {
+        return s.build(d).sql
+    } catch (e: q.QueryError) {
+        return "error: " + e.message
+    }
+}
+
+fn check(got: string, want: string): void {
+    if (got != want) {
+        fmt.println("want: " + want)
+        fmt.println("got:  " + got)
+        assert(false)
+    }
+}
+
+fn intAt(args: q.Value[], i: int): long {
+    switch (args[i]) {
+        case Value.Int(v): {
+            return v
+        }
+        default: {
+            return -1
+        }
+    }
+}
+
+fn textAt(args: q.Value[], i: int): string {
+    switch (args[i]) {
+        case Value.Text(v): {
+            return v
+        }
+        default: {
+            return "<not text>"
+        }
+    }
+}
+
+fn selects(): void {
+    let basic: q.Select = q.from("users u")
+        .columns(["u.id", "u.name AS n"])
+        .where(q.col("u.age").gte(q.integer(18)))
+        .orderBy("u.name DESC")
+        .limit(10)
+    check(
+        sel(basic, PG),
+        "SELECT \"u\".\"id\", \"u\".\"name\" AS \"n\" FROM \"users\" AS \"u\" WHERE \"u\".\"age\" >= $1 ORDER BY \"u\".\"name\" DESC LIMIT $2"
+    )
+    check(
+        sel(basic, MY),
+        "SELECT `u`.`id`, `u`.`name` AS `n` FROM `users` AS `u` WHERE `u`.`age` >= ? ORDER BY `u`.`name` DESC LIMIT ?"
+    )
+    check(
+        sel(basic, LITE),
+        "SELECT \"u\".\"id\", \"u\".\"name\" AS \"n\" FROM \"users\" AS \"u\" WHERE \"u\".\"age\" >= ? ORDER BY \"u\".\"name\" DESC LIMIT ?"
+    )
+    try {
+        let built: q.Query = basic.build(PG)
+        assert(built.args.len() == 2)
+        assert(intAt(built.args, 0) == 18)
+        assert(intAt(built.args, 1) == 10)
+        assert(!built.hasParams())
+    } catch (e: q.QueryError) {
+        assert(false)
+    }
+
+    check(sel(q.from("users"), PG), "SELECT * FROM \"users\"")
+    check(sel(q.from("public.users AS u"), PG), "SELECT * FROM \"public\".\"users\" AS \"u\"")
+    check(sel(q.from("users").columns(["u.*"]), MY), "SELECT `u`.* FROM `users`")
+    check(sel(q.from("t").columns(["a"]).distinct(), PG), "SELECT DISTINCT \"a\" FROM \"t\"")
+    check(sel(q.select([q.countAll().alias("n")]).from("t"), PG), "SELECT COUNT(*) AS \"n\" FROM \"t\"")
+}
+
+fn conditions(): void {
+    let a: q.Expr = q.col("a").eq(q.integer(1))
+    let b: q.Expr = q.col("b").eq(q.integer(2))
+    let c: q.Expr = q.col("c").eq(q.integer(3))
+
+    check(sel(q.from("t").where(a.or(b)), PG), "SELECT * FROM \"t\" WHERE \"a\" = $1 OR \"b\" = $2")
+    check(
+        sel(q.from("t").where(a.or(b)).where(q.col("c").isNull()), PG),
+        "SELECT * FROM \"t\" WHERE (\"a\" = $1 OR \"b\" = $2) AND \"c\" IS NULL"
+    )
+    check(
+        sel(q.from("t").where(a.and(b).and(c)), PG),
+        "SELECT * FROM \"t\" WHERE \"a\" = $1 AND \"b\" = $2 AND \"c\" = $3"
+    )
+    check(
+        sel(q.from("t").where(q.and([a, q.or([b, c])])), PG),
+        "SELECT * FROM \"t\" WHERE \"a\" = $1 AND (\"b\" = $2 OR \"c\" = $3)"
+    )
+    check(sel(q.from("t").where(a.not()), PG), "SELECT * FROM \"t\" WHERE NOT (\"a\" = $1)")
+    check(sel(q.from("t").where(q.col("a").eq(q.sqlNull())), PG), "SELECT * FROM \"t\" WHERE \"a\" IS NULL")
+    check(sel(q.from("t").where(q.col("a").neq(q.sqlNull())), PG), "SELECT * FROM \"t\" WHERE \"a\" IS NOT NULL")
+    let nothing: q.Expr[] = []
+    check(sel(q.from("t").where(q.or(nothing)), PG), "SELECT * FROM \"t\" WHERE 1 = 0")
+    check(sel(q.from("t").where(q.and(nothing)), PG), "SELECT * FROM \"t\" WHERE 1 = 1")
+
+    check(
+        sel(q.from("t").where(q.col("id").in([q.integer(1), q.integer(2), q.integer(3)])), PG),
+        "SELECT * FROM \"t\" WHERE \"id\" IN ($1, $2, $3)"
+    )
+    check(sel(q.from("t").where(q.col("id").in(nothing)), PG), "SELECT * FROM \"t\" WHERE 1 = 0")
+    check(sel(q.from("t").where(q.col("id").notIn(nothing)), PG), "SELECT * FROM \"t\" WHERE 1 = 1")
+    check(
+        sel(q.from("t").where(q.col("age").between(q.integer(18), q.integer(65))), PG),
+        "SELECT * FROM \"t\" WHERE \"age\" BETWEEN $1 AND $2"
+    )
+    let named: q.Select = q.from("t").where(q.col("name").ilike(q.text("a%")))
+    check(sel(named, PG), "SELECT * FROM \"t\" WHERE \"name\" ILIKE $1")
+    check(sel(named, MY), "SELECT * FROM `t` WHERE `name` LIKE ?")
+    let active: q.Select = q.from("t").where(q.col("active").eq(q.boolean(true)))
+    check(sel(active, PG), "SELECT * FROM \"t\" WHERE \"active\" = TRUE")
+    check(sel(active, LITE), "SELECT * FROM \"t\" WHERE \"active\" = 1")
+    try {
+        assert(active.build(PG).args.len() == 0)
+    } catch (e: q.QueryError) {
+        assert(false)
+    }
+
+    check(
+        sel(q.from("t").where(q.col("price").times(q.col("qty")).gt(q.integer(100))), PG),
+        "SELECT * FROM \"t\" WHERE (\"price\" * \"qty\") > $1"
+    )
+    let full: q.Select = q.from("p").select([q.col("first").concat(q.text(" ")).concat(q.col("last")).alias("full")])
+    check(sel(full, PG), "SELECT (\"first\" || $1) || \"last\" AS \"full\" FROM \"p\"")
+    check(sel(full, MY), "SELECT CONCAT(CONCAT(`first`, ?), `last`) AS `full` FROM `p`")
+}
+
+fn shapes(): void {
+    let report: q.Select = q.from("orders")
+        .select([q.col("user_id"), q.count(q.col("id")).alias("n"), q.sum(q.col("total")).alias("spent")])
+        .groupBy(["user_id"])
+        .having(q.countAll().gt(q.integer(5)))
+        .orderByExpr(q.sum(q.col("total")).desc())
+    check(
+        sel(report, PG),
+        "SELECT \"user_id\", COUNT(\"id\") AS \"n\", SUM(\"total\") AS \"spent\" FROM \"orders\" GROUP BY \"user_id\" HAVING COUNT(*) > $1 ORDER BY SUM(\"total\") DESC"
+    )
+
+    let joined: q.Select = q.from("users u")
+        .columns(["u.id", "o.total"])
+        .join("orders o", q.col("o.user_id").eq(q.col("u.id")))
+        .leftJoin("profiles p", q.col("p.user_id").eq(q.col("u.id")).and(q.col("p.public").eq(q.boolean(true))))
+    check(
+        sel(joined, PG),
+        "SELECT \"u\".\"id\", \"o\".\"total\" FROM \"users\" AS \"u\" JOIN \"orders\" AS \"o\" ON \"o\".\"user_id\" = \"u\".\"id\" LEFT JOIN \"profiles\" AS \"p\" ON \"p\".\"user_id\" = \"u\".\"id\" AND \"p\".\"public\" = TRUE"
+    )
+    check(
+        sel(q.from("a").joinUsing("b", ["id"]).crossJoin("c"), PG),
+        "SELECT * FROM \"a\" JOIN \"b\" USING (\"id\") CROSS JOIN \"c\""
+    )
+    check(sel(q.from("a").fullJoin("b", q.col("a.id").eq(q.col("b.id"))), MY), "error: MySQL has no FULL JOIN")
+
+    let paged: q.Select = q.from("t").offset(20)
+    check(sel(paged, PG), "SELECT * FROM \"t\" OFFSET $1")
+    check(sel(paged, MY), "SELECT * FROM `t` LIMIT 18446744073709551615 OFFSET ?")
+    check(sel(paged, LITE), "SELECT * FROM \"t\" LIMIT -1 OFFSET ?")
+
+    let job: q.Select = q.from("jobs").where(q.col("state").eq(q.text("ready"))).limit(1).forUpdate().skipLocked()
+    check(sel(job, PG), "SELECT * FROM \"jobs\" WHERE \"state\" = $1 LIMIT $2 FOR UPDATE SKIP LOCKED")
+    check(sel(job, LITE), "error: SQLite has no row locks: FOR UPDATE SKIP LOCKED")
+    check(sel(q.from("jobs").skipLocked(), PG), "error: skipLocked and noWait follow forUpdate or forShare")
+
+    let both: q.Select = q.from("a").columns(["id"]).union(q.from("b").columns(["id"])).orderBy("id")
+    check(sel(both, PG), "SELECT \"id\" FROM \"a\" UNION SELECT \"id\" FROM \"b\" ORDER BY \"id\"")
+    check(
+        sel(q.from("a").unionAll(q.from("b").limit(1)), PG),
+        "error: UNION ALL takes a query without its own ORDER BY, LIMIT, OFFSET or WITH; put them on the first"
+    )
+
+    let recent: q.Select =
+        q.from("recent").with("recent", q.from("orders").where(q.col("created_at").gt(q.text("2026-01-01"))))
+    check(
+        sel(recent, PG),
+        "WITH \"recent\" AS (SELECT * FROM \"orders\" WHERE \"created_at\" > $1) SELECT * FROM \"recent\""
+    )
+    check(
+        sel(q.from("tree").withRecursive("tree", q.from("nodes")), PG),
+        "WITH RECURSIVE \"tree\" AS (SELECT * FROM \"nodes\") SELECT * FROM \"tree\""
+    )
+
+    let page: q.Select = q.from("users").where(q.col("active").eq(q.boolean(true))).orderBy("id").limit(10)
+    check(
+        sel(page.count(), PG),
+        "SELECT COUNT(*) FROM (SELECT * FROM \"users\" WHERE \"active\" = TRUE) AS \"counted\""
+    )
+}
+
+fn subqueries(): void {
+    let big: q.Select = q.from("orders").columns(["user_id"]).where(q.col("total").gt(q.integer(100)))
+    check(
+        sel(q.from("users").where(q.col("age").gt(q.integer(1))).where(q.col("id").inSelect(big)), PG),
+        "SELECT * FROM \"users\" WHERE \"age\" > $1 AND \"id\" IN (SELECT \"user_id\" FROM \"orders\" WHERE \"total\" > $2)"
+    )
+    check(
+        sel(q.select([q.col("x.user_id")]).fromExpr(q.sub(q.from("orders").columns(["user_id"])).alias("x")), PG),
+        "SELECT \"x\".\"user_id\" FROM (SELECT \"user_id\" FROM \"orders\") AS \"x\""
+    )
+    check(
+        sel(q.from("users u").where(q.exists(q.from("orders o").where(q.col("o.user_id").eq(q.col("u.id"))))), PG),
+        "SELECT * FROM \"users\" AS \"u\" WHERE EXISTS (SELECT * FROM \"orders\" AS \"o\" WHERE \"o\".\"user_id\" = \"u\".\"id\")"
+    )
+}
+
+fn expressions(): void {
+    check(
+        sel(q.from("t").where(q.rawWith("? BETWEEN lo AND hi", [q.integer(5)])), PG),
+        "SELECT * FROM \"t\" WHERE $1 BETWEEN lo AND hi"
+    )
+    check(
+        sel(
+            q.from("t").where(q.rawWith("a = ? OR b = ?", [q.integer(1), q.integer(2)])).where(q.col("c").isNull()),
+            LITE
+        ),
+        "SELECT * FROM \"t\" WHERE (a = ? OR b = ?) AND \"c\" IS NULL"
+    )
+    check(sel(q.from("t").where(q.raw("data ?? 'key'")), PG), "SELECT * FROM \"t\" WHERE data ? 'key'")
+    let noHoles: q.Expr[] = []
+    check(sel(q.from("t").where(q.rawWith("a = ?", noHoles)), PG), "error: more ? than arguments in: a = ?")
+    check(sel(q.from("t").where(q.rawWith("a = 1", [q.integer(1)])), PG), "error: fewer ? than arguments in: a = 1")
+
+    let grade: q.Expr = q.caseWhen(q.col("score").gte(q.integer(90)), q.text("A"))
+        .when(q.col("score").gte(q.integer(80)), q.text("B"))
+        .orElse(q.text("C"))
+        .alias("grade")
+    check(
+        sel(q.from("t").select([grade]), PG),
+        "SELECT CASE WHEN \"score\" >= $1 THEN $2 WHEN \"score\" >= $3 THEN $4 ELSE $5 END AS \"grade\" FROM \"t\""
+    )
+    check(
+        sel(q.from("t").select([q.col("id").cast("varchar(20)")]), PG),
+        "SELECT CAST(\"id\" AS varchar(20)) FROM \"t\""
+    )
+    check(sel(q.from("t").select([q.col("id").cast("text; DROP")]), PG), "error: 'text; DROP' is not a type name")
+    check(
+        sel(q.from("t").select([q.call("date_trunc", [q.text("day"), q.col("created_at")])]), PG),
+        "SELECT date_trunc($1, \"created_at\") FROM \"t\""
+    )
+    let noArgs: q.Expr[] = []
+    check(sel(q.from("t").select([q.call("now()--", noArgs)]), PG), "error: 'now()--' is not a function name")
+    check(
+        sel(
+            q.from("t").select([
+                q.call("row_number", noArgs).over([q.col("team")], [q.col("score").desc()]).alias("rank")
+            ]),
+            PG
+        ),
+        "SELECT row_number() OVER (PARTITION BY \"team\" ORDER BY \"score\" DESC) AS \"rank\" FROM \"t\""
+    )
+    check(
+        sel(q.from("t").select([q.countDistinct(q.col("user_id")), q.coalesce([q.col("nick"), q.col("name")])]), PG),
+        "SELECT COUNT(DISTINCT \"user_id\"), COALESCE(\"nick\", \"name\") FROM \"t\""
+    )
+}
+
+// Names are quoted, so anything that reaches one is data, never SQL.
+fn quoting(): void {
+    check(sel(q.from("t").columns(["we\"ird"]), PG), "SELECT \"we\"\"ird\" FROM \"t\"")
+    check(sel(q.from("t").columns(["we`ird"]), MY), "SELECT `we``ird` FROM `t`")
+    check(
+        sel(q.from("t").orderBy("name; DROP TABLE users"), PG),
+        "error: cannot read 'name; DROP TABLE users' as a column and ASC or DESC"
+    )
+    check(sel(q.from("t").orderBy("name DESC;"), PG), "error: cannot read 'name DESC;' as a column and ASC or DESC")
+    check(sel(q.from("t").orderBy("name;--"), PG), "SELECT * FROM \"t\" ORDER BY \"name;--\"")
+    check(sel(q.from("t").columns(["a..b"]), PG), "error: 'a..b' has an empty part")
+    check(sel(q.from("users x y"), PG), "error: cannot read 'users x y' as a name and an alias")
+    check(sel(q.from("users"), PG), "SELECT * FROM \"users\"")
+}
+
+fn params(): void {
+    let tpl: q.Select = q.from("users")
+        .where(q.col("id").eq(q.param("id")))
+        .where(q.col("org").eq(q.param("org")))
+        .where(q.col("owner").eq(q.param("id")))
+        .where(q.col("age").gt(q.integer(21)))
+    check(
+        sel(tpl, PG),
+        "SELECT * FROM \"users\" WHERE \"id\" = $1 AND \"org\" = $2 AND \"owner\" = $1 AND \"age\" > $3"
+    )
+    check(sel(tpl, LITE), "SELECT * FROM \"users\" WHERE \"id\" = ? AND \"org\" = ? AND \"owner\" = ? AND \"age\" > ?")
+    try {
+        let pg: q.Query = tpl.build(PG)
+        assert(pg.hasParams())
+        let args: q.Value[] = pg.bind().setInt("id", 7).setText("org", "acme").args()
+        assert(args.len() == 3)
+        assert(intAt(args, 0) == 7)
+        assert(textAt(args, 1) == "acme")
+        assert(intAt(args, 2) == 21)
+        // The query is untouched by binding, so it can be bound again.
+        let again: q.Value[] = pg.bind().setInt("id", 8).setText("org", "beta").args()
+        assert(intAt(again, 0) == 8)
+        assert(intAt(pg.args, 0) == -1)
+
+        let lite: q.Query = tpl.build(LITE)
+        let largs: q.Value[] = lite.bind().setLong("id", 9).setText("org", "x").args()
+        assert(largs.len() == 4)
+        assert(intAt(largs, 0) == 9)
+        assert(intAt(largs, 2) == 9)
+        assert(intAt(largs, 3) == 21)
+    } catch (e: q.QueryError) {
+        fmt.println(e.message)
+        assert(false)
+    }
+
+    let missing: string = ""
+    try {
+        let pg: q.Query = tpl.build(PG)
+        pg.bind().setInt("id", 1).args()
+    } catch (e: q.QueryError) {
+        missing = e.message
+    }
+
+    check(missing, "parameter 'org' has no value")
+
+    let unknown: string = ""
+    try {
+        let pg: q.Query = tpl.build(PG)
+        pg.bind().setInt("id", 1).setText("org", "a").setInt("nope", 2).args()
+    } catch (e: q.QueryError) {
+        unknown = e.message
+    }
+
+    check(unknown, "the query has no parameter named 'nope'")
+
+    let paged: q.Select = q.from("posts").orderBy("id").limitExpr(q.param("n")).offsetExpr(q.param("skip"))
+    check(sel(paged, PG), "SELECT * FROM \"posts\" ORDER BY \"id\" LIMIT $1 OFFSET $2")
+}
+
+fn projection(): void {
+    let a: Account = Account {}
+    let s: q.Select = q.from("accounts").fields(reflect.fields(a), reflect.fieldTags(a, "db"))
+    check(sel(s, PG), "SELECT \"id\", \"full_name\", lower(email) AS \"email\" FROM \"accounts\"")
+}
+
+fn inserts(): void {
+    let two: q.Insert = q.insertInto("users")
+        .columns(["name", "age"])
+        .values([q.text("ada"), q.integer(36)])
+        .values([q.text("grace"), q.integer(45)])
+        .returning(["id"])
+    check(ins(two, PG), "INSERT INTO \"users\" (\"name\", \"age\") VALUES ($1, $2), ($3, $4) RETURNING \"id\"")
+    check(ins(two, MY), "error: MySQL has no RETURNING")
+    check(
+        ins(q.insertInto("users").set("name", q.text("ada")).set("active", q.boolean(true)), PG),
+        "INSERT INTO \"users\" (\"name\", \"active\") VALUES ($1, TRUE)"
+    )
+
+    let up: q.Insert = q.insertInto("users")
+        .columns(["email", "name"])
+        .values([q.text("a@x"), q.text("A")])
+        .onConflict(["email"])
+    check(
+        ins(up.doUpdate(["name"]), PG),
+        "INSERT INTO \"users\" (\"email\", \"name\") VALUES ($1, $2) ON CONFLICT (\"email\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""
+    )
+    check(
+        ins(up.doUpdate(["name"]), MY),
+        "INSERT INTO `users` (`email`, `name`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
+    )
+    check(
+        ins(up.doUpdateSet("visits", q.col("users.visits").plus(q.integer(1))), LITE),
+        "INSERT INTO \"users\" (\"email\", \"name\") VALUES (?, ?) ON CONFLICT (\"email\") DO UPDATE SET \"visits\" = (\"users\".\"visits\" + ?)"
+    )
+    check(
+        ins(up.doNothing(), PG),
+        "INSERT INTO \"users\" (\"email\", \"name\") VALUES ($1, $2) ON CONFLICT (\"email\") DO NOTHING"
+    )
+    check(ins(up.doNothing(), MY), "INSERT IGNORE INTO `users` (`email`, `name`) VALUES (?, ?)")
+    check(ins(up, PG), "error: onConflict() needs doNothing() or doUpdate()")
+    check(
+        ins(q.insertInto("users").columns(["email"]).values([q.text("a")]).doUpdate(["email"]), PG),
+        "error: doUpdate() needs onConflict(columns) to name the unique key"
+    )
+
+    let archive: q.Insert = q.insertInto("archive")
+        .columns(["id"])
+        .fromSelect(q.from("users").columns(["id"]).where(q.col("active").eq(q.boolean(false))))
+    check(ins(archive, PG), "INSERT INTO \"archive\" (\"id\") SELECT \"id\" FROM \"users\" WHERE \"active\" = FALSE")
+    check(
+        ins(archive.doNothing(), LITE),
+        "INSERT INTO \"archive\" (\"id\") SELECT * FROM (SELECT \"id\" FROM \"users\" WHERE \"active\" = 0) WHERE true ON CONFLICT DO NOTHING"
+    )
+
+    check(
+        ins(q.insertInto("t").columns(["a", "b"]).values([q.integer(1), q.integer(2)]).values([q.integer(3)]), PG),
+        "error: row 2 has 1 values for 2 columns"
+    )
+    check(ins(q.insertInto("t").columns(["a"]), PG), "error: an INSERT needs values(), set() or fromSelect()")
+    check(
+        ins(q.insertInto("t").columns(["a"]).set("b", q.integer(1)), PG),
+        "error: set() makes the row; it cannot be mixed with columns(), values() or fromSelect()"
+    )
+}
+
+// Rows past a chunk boundary keep their order, and two inserts branched from
+// one base each see only their own last row.
+fn bulk(): void {
+    let base: q.Insert = q.insertInto("nums").columns(["n"])
+    for (let i: int = 0; i < 1000; i++) {
+        base = base.values([q.integer(i)])
+    }
+
+    let left: q.Insert = base.values([q.integer(-1)])
+    let right: q.Insert = base.values([q.integer(-2)])
+    try {
+        let b: q.Query = base.build(PG)
+        assert(b.args.len() == 1000)
+        for (let i: int = 0; i < 1000; i++) {
+            assert(intAt(b.args, i) == i)
+        }
+
+        assert(b.sql.startsWith("INSERT INTO \"nums\" (\"n\") VALUES ($1), ($2), "))
+        assert(b.sql.endsWith("($999), ($1000)"))
+        let l: q.Query = left.build(LITE)
+        let r: q.Query = right.build(LITE)
+        assert(l.args.len() == 1001)
+        assert(intAt(l.args, 1000) == -1)
+        assert(intAt(r.args, 1000) == -2)
+        assert(intAt(r.args, 999) == 999)
+    } catch (e: q.QueryError) {
+        assert(false)
+    }
+}
+
+fn updatesAndDeletes(): void {
+    let u: q.Update = q.update("users")
+        .set("name", q.text("x"))
+        .set("visits", q.col("visits").plus(q.integer(1)))
+        .where(q.col("id").eq(q.integer(3)))
+        .returning(["id"])
+    check(
+        upd(u, PG),
+        "UPDATE \"users\" SET \"name\" = $1, \"visits\" = (\"visits\" + $2) WHERE \"id\" = $3 RETURNING \"id\""
+    )
+    check(upd(u, MY), "error: MySQL has no RETURNING")
+    let everyone: q.Update = q.update("users").set("name", q.text("x"))
+    check(upd(everyone, PG), "error: an UPDATE without where() changes every row; call all() if that is meant")
+    check(upd(everyone.all(), PG), "UPDATE \"users\" SET \"name\" = $1")
+    check(upd(q.update("users").where(q.col("id").eq(q.integer(1))), PG), "error: an UPDATE needs at least one set()")
+
+    let d: q.Delete = q.deleteFrom("sessions").where(q.col("expires_at").lt(q.text("now")))
+    check(del(d, MY), "DELETE FROM `sessions` WHERE `expires_at` < ?")
+    check(del(d.returning(["id"]), LITE), "DELETE FROM \"sessions\" WHERE \"expires_at\" < ? RETURNING \"id\"")
+    check(
+        del(q.deleteFrom("sessions"), PG),
+        "error: a DELETE without where() removes every row; call all() if that is meant"
+    )
+    check(del(q.deleteFrom("sessions").all(), PG), "DELETE FROM \"sessions\"")
+}
+
+// A builder method returns a new value and leaves its receiver as it was.
+fn immutability(): void {
+    let base: q.Select = q.from("users").where(q.col("active").eq(q.boolean(true)))
+    let byName: q.Select = base.where(q.col("name").eq(q.text("ada")))
+    let newest: q.Select = base.orderBy("id DESC").limit(5)
+    check(sel(base, PG), "SELECT * FROM \"users\" WHERE \"active\" = TRUE")
+    check(sel(byName, PG), "SELECT * FROM \"users\" WHERE \"active\" = TRUE AND \"name\" = $1")
+    check(sel(newest, PG), "SELECT * FROM \"users\" WHERE \"active\" = TRUE ORDER BY \"id\" DESC LIMIT $1")
+    base.where(q.col("ignored").isNull())
+    check(sel(base, PG), "SELECT * FROM \"users\" WHERE \"active\" = TRUE")
+}
+
+// Threads branch one shared base at once; nodes are immutable, so they can.
+fn sharedAcrossThreads(): void {
+    let base: q.Select = q.from("events").where(q.col("tenant").eq(q.param("tenant")))
+    let done = channel(int)
+    for (let t: int = 0; t < 4; t++) {
+        spawn {
+            let ok: int = 0
+            for (let i: int = 0; i < 300; i++) {
+                let mine: q.Select = base.where(q.col("kind").eq(q.integer(i))).limit(10)
+                try {
+                    let built: q.Query = mine.build(PG)
+                    if (built.sql == "SELECT * FROM \"events\" WHERE \"tenant\" = $1 AND \"kind\" = $2 LIMIT $3") {
+                        ok = ok + 1
+                    }
+                } catch (e: q.QueryError) {}
+            }
+
+            send(done, ok)
+        }
+    }
+
+    for (let t: int = 0; t < 4; t++) {
+        assert(receive(done) == 300)
+    }
+}
+
+// 20,000 rows built and released on a worker thread, whose stack is far
+// smaller than main's: the row chain is chunked, so releasing it is shallow.
+fn bulkOnWorker(): void {
+    let done = channel(int)
+    spawn {
+        let ins: q.Insert = q.insertInto("nums").columns(["n"])
+        for (let i: int = 0; i < 20000; i++) {
+            ins = ins.values([q.integer(i)])
+        }
+
+        let n: int = 0
+        try {
+            n = ins.build(PG).args.len()
+        } catch (e: q.QueryError) {}
+
+        send(done, n)
+    }
+
+    assert(receive(done) == 20000)
+}
+
+fn main(): void {
+    selects()
+    conditions()
+    shapes()
+    subqueries()
+    expressions()
+    quoting()
+    params()
+    projection()
+    inserts()
+    bulk()
+    updatesAndDeletes()
+    immutability()
+    sharedAcrossThreads()
+    bulkOnWorker()
+    for (let i: int = 0; i < 200; i++) {
+        conditions()
+        params()
+    }
+
+    fmt.println("dexqu_test: all assertions passed")
+}

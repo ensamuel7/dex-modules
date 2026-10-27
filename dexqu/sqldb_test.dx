@@ -1,0 +1,125 @@
+import "db"
+import "fmt"
+import "reflect"
+import "github.com/ensamuel7/dex-modules/dexqu" as "q"
+import "github.com/ensamuel7/dex-modules/dexqu/sqldb"
+
+const LITE: q.Dialect = q.Dialect.SQLite
+
+struct Player {
+    id: long
+    name: string
+    team: string
+    score: double
+}
+
+fn run(conn: int): void throws q.QueryError {
+    db.exec(conn, "DROP TABLE IF EXISTS players")
+    db.exec(
+        conn,
+        "CREATE TABLE players(id INTEGER PRIMARY KEY, name TEXT UNIQUE, team TEXT, score REAL, active INT DEFAULT 1)"
+    )
+
+    let add: q.Insert = q.insertInto("players")
+        .columns(["name", "team", "score"])
+        .values([q.text("ada"), q.text("red"), q.real(9.5)])
+        .values([q.text("grace"), q.text("blue"), q.real(7.0)])
+        .values([q.text("O'Brien; DROP TABLE players; --"), q.text("red"), q.real(3.25)])
+    sqldb.exec(conn, add.build(LITE))
+
+    // The same name again: the upsert updates the score instead of failing.
+    let again: q.Insert = q.insertInto("players")
+        .columns(["name", "team", "score"])
+        .values([q.text("ada"), q.text("red"), q.real(10.0)])
+        .onConflict(["name"])
+        .doUpdate(["score"])
+    sqldb.exec(conn, again.build(LITE))
+
+    // Columns from the struct, rows filled into it.
+    let p: Player = Player {}
+    let reds: q.Select = q.from("players")
+        .fields(reflect.fields(p), reflect.fieldTags(p, "db"))
+        .where(q.col("team").eq(q.text("red")))
+        .orderBy("score DESC")
+    let st: int = sqldb.query(conn, reds.build(LITE))
+    let seen: string[] = []
+    while (db.next(st)) {
+        db.fill(p, st)
+        seen.push(p.name)
+    }
+
+    db.finalize(st)
+    assert(seen.len() == 2)
+    assert(seen[0] == "ada")
+    assert(seen[1] == "O'Brien; DROP TABLE players; --")
+    assert(p.score == 3.25)
+
+    // Built once, run with different values.
+    let byTeam: q.Query = q.from("players")
+        .select([q.countAll()])
+        .where(q.col("team").eq(q.param("team")))
+        .where(q.col("active").eq(q.boolean(true)))
+        .build(LITE)
+    let blue: int = sqldb.prepare(conn, byTeam.sql, byTeam.bind().setText("team", "blue").args())
+    assert(db.next(blue))
+    let blues: int = db.col(blue, 0)
+    db.finalize(blue)
+    assert(blues == 1)
+    let red: int = sqldb.prepare(conn, byTeam.sql, byTeam.bind().setText("team", "red").args())
+    assert(db.next(red))
+    let redCount: int = db.col(red, 0)
+    db.finalize(red)
+    assert(redCount == 2)
+
+    let top: int = sqldb.query(conn, q.from("players").select([q.max(q.col("score"))]).build(LITE))
+    assert(db.next(top))
+    let best: double = db.col(top, 0)
+    db.finalize(top)
+    assert(best == 10.0)
+
+    let bench: q.Update = q.update("players")
+        .set("active", q.boolean(false))
+        .where(q.col("score").lt(q.real(5.0)))
+        .returning(["name"])
+    let benched: int = sqldb.query(conn, bench.build(LITE))
+    assert(db.next(benched))
+    let who: string = db.col(benched, 0)
+    db.finalize(benched)
+    assert(who == "O'Brien; DROP TABLE players; --")
+
+    let page: q.Select = q.from("players").where(q.col("active").eq(q.boolean(true))).orderBy("id").limit(1)
+    let total: int = sqldb.query(conn, page.count().build(LITE))
+    assert(db.next(total))
+    let n: int = db.col(total, 0)
+    db.finalize(total)
+    assert(n == 2)
+
+    sqldb.exec(conn, q.deleteFrom("players").where(q.col("active").eq(q.boolean(false))).build(LITE))
+    let left: int = sqldb.query(conn, q.from("players").select([q.countAll()]).build(LITE))
+    assert(db.next(left))
+    let remaining: int = db.col(left, 0)
+    db.finalize(left)
+    assert(remaining == 2)
+
+    let refused: bool = false
+    try {
+        sqldb.query(conn, byTeam)
+    } catch (e: q.QueryError) {
+        refused = true
+    }
+
+    assert(refused)
+}
+
+fn main(): void {
+    let conn: int = db.open("sqlite", "build/sqldb_test.db")
+    try {
+        run(conn)
+    } catch (e: q.QueryError) {
+        fmt.println("sqldb_test failed: " + e.message)
+        assert(false)
+    }
+
+    db.close(conn)
+    fmt.println("sqldb_test: all assertions passed")
+}

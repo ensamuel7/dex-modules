@@ -601,12 +601,22 @@ fn laterals(): void {
     }
 }
 
+fn returningExprs(): void {
+    let author: q.Expr = q.sub(q.from("users u").columns(["u.username"]).where(q.col("u.id").eq(q.col("comments.author_id")))).alias("username")
+    let insert: q.Insert = q.insertInto("comments").columns(["body", "author_id"]).values([q.param("body"), q.param("author")]).returning(["id"]).returningExpr([author])
+    check(
+        ins(insert, PG),
+        "INSERT INTO \"comments\" (\"body\", \"author_id\") VALUES ($1, $2) RETURNING \"id\", (SELECT \"u\".\"username\" FROM \"users\" AS \"u\" WHERE \"u\".\"id\" = \"comments\".\"author_id\") AS \"username\""
+    )
+}
+
 fn main(): void {
     selects()
     conditions()
     shapes()
     subqueries()
     laterals()
+    returningExprs()
     expressions()
     quoting()
     params()

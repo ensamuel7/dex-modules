@@ -810,6 +810,15 @@ struct Insert {
         return n
     }
 
+    fn returningExpr(items: Expr[]): Insert {
+        let n: Insert = self.clone()
+        foreach (items as e) {
+            n.returns = Node.Cons(n.returns, e.node)
+        }
+
+        return n
+    }
+
     fn build(d: Dialect): Query throws QueryError {
         let r: Renderer = newRenderer(d)
         let sb = StringBuilder()

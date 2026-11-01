@@ -170,7 +170,7 @@ A table is `"users"`, `"public.users"`, `"users u"` or `"users AS u"`.
 **INSERT**: `insertInto(table)`, then `columns(names)` and `values(row)` per
 row, or `set(column, value)` per column for one row, or `fromSelect(q)`.
 Upserts: `onConflict(columns)` with `doNothing()`, `doUpdate(columns)` or
-`doUpdateSet(column, value)`. Also `returning(columns)` and `build(d)`.
+`doUpdateSet(column, value)`. Also `returning(columns)`, `returningExpr(exprs)` and `build(d)`.
 
 **UPDATE**: `update(table).set(column, value).where(c)`, `returning`, `all()`.
 **DELETE**: `deleteFrom(table).where(c)`, `returning`, `all()`.

@@ -80,6 +80,17 @@ let args: q.Value[] = byEmail.bind().setText("email", email).args()
 Postgres a parameter used twice is one `$n`. LIMIT and OFFSET are bound too,
 so every page of a listing is the same statement: `limitExpr(q.param("n"))`.
 
+A statement prepared once with `db.prepare` can be bound by name without
+building an argument array per run: `slots(name)` gives the 1-based
+placeholder positions a parameter fills, one on Postgres, one per use with `?`:
+
+```dex
+let st: int = db.prepare(conn, byEmail.sql)
+foreach (byEmail.slots("email") as at) {
+    db.bindStr(st, at, email)
+}
+```
+
 ## Running a query
 
 `Query.sql` and `Query.args` go to whatever driver you use. Each argument is a
@@ -134,20 +145,23 @@ let q1: q.Select = q.from("accounts").fields(reflect.fields(a), reflect.fieldTag
 **On an `Expr`**: `eq neq lt lte gt gte`, `isNull isNotNull`,
 `like notLike ilike notIlike`, `in notIn` (an `Expr[]`), `inSelect notInSelect`,
 `between notBetween`, `and or not`, `plus minus times div concat`, `asc desc`,
-`alias(name)`, `cast(type)`, `over(partitionBy, orderBy)`.
+`alias(name)`, `aliasColumns(name, columns)`, `cast(type)`, `over(partitionBy, orderBy)`.
+`aliasColumns` names a source's columns too, as `unnest(...)` needs:
+`AS "r"("i", "k")`. A cast type may end in `[]`, such as `int4[]`.
 
 **Functions**: `and(list)`, `or(list)`, `not(e)`, `tuple(list)`, `call(name, args)`,
 `count countAll countDistinct sum avg min max coalesce lower upper`, `sub(select)`,
-`exists notExists`, `excluded(column)`, `caseWhen(c, r).when(c, r).orElse(r)` or `.end()`.
+`exists notExists`, `arrayOf(select)` (`ARRAY(SELECT ...)`, Postgres only), `excluded(column)`, `caseWhen(c, r).when(c, r).orElse(r)` or `.end()`.
 
 **SELECT**: `from(table)` or `select(exprs)`, then `columns(names)`, `select(exprs)`,
 `fields(names, tags)`, `distinct()`, `from(table)`, `fromExpr(e)`,
 `join leftJoin rightJoin fullJoin (table, on)`, `crossJoin(table)`,
-`joinExpr leftJoinExpr (e, on)`, `joinUsing(table, columns)`, `where(c)`,
+`joinExpr leftJoinExpr (e, on)`, `crossJoinLateral(e)`,
+`joinLateral leftJoinLateral (e, on)`, `joinUsing(table, columns)`, `where(c)`,
 `groupBy(names)`, `groupByExpr(exprs)`, `having(c)`, `orderBy(spec)`,
 `orderByExpr(e)`, `limit offset (int)`, `limitExpr offsetExpr (e)`,
 `forUpdate forShare skipLocked noWait`, `union unionAll intersect except (q)`,
-`with withRecursive (name, q)`, `count()`, `build(d)`.
+`with withMaterialized withRecursive (name, q)`, `count()`, `build(d)`.
 
 A table is `"users"`, `"public.users"`, `"users u"` or `"users AS u"`.
 `count()` turns a page query into its total:
@@ -156,7 +170,7 @@ A table is `"users"`, `"public.users"`, `"users u"` or `"users AS u"`.
 **INSERT**: `insertInto(table)`, then `columns(names)` and `values(row)` per
 row, or `set(column, value)` per column for one row, or `fromSelect(q)`.
 Upserts: `onConflict(columns)` with `doNothing()`, `doUpdate(columns)` or
-`doUpdateSet(column, value)`. Also `returning(columns)` and `build(d)`.
+`doUpdateSet(column, value)`. Also `returning(columns)`, `returningExpr(exprs)` and `build(d)`.
 
 **UPDATE**: `update(table).set(column, value).where(c)`, `returning`, `all()`.
 **DELETE**: `deleteFrom(table).where(c)`, `returning`, `all()`.
@@ -179,6 +193,9 @@ forgotten condition rewrites or empties the table. `all()` says that is meant.
 | `returning` | yes | refused | yes (3.35+) |
 | row locks | yes | yes | refused |
 | `fullJoin` | yes | refused | yes (3.39+) |
+| LATERAL joins | yes | yes (8.0.14+) | refused |
+| `withMaterialized` | yes | refused | yes (3.35+) |
+| `arrayOf` | yes | refused | refused |
 
 MySQL has no conflict target: `ON DUPLICATE KEY` applies to every unique key,
 so `onConflict(columns)` is ignored there.

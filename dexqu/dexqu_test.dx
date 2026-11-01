@@ -549,11 +549,64 @@ fn bulkOnWorker(): void {
     assert(receive(done) == 20000)
 }
 
+fn laterals(): void {
+    let req: q.Expr = q.call("unnest", [q.param("ids").cast("int4[]"), q.param("keys").cast("text[]")]).aliasColumns("r", ["i", "k"])
+    let page: q.Select = q.from("articles a").columns(["a.id"]).where(q.col("a.slug").eq(q.col("r.k"))).limit(1)
+    let batch: q.Select = q.select([q.col("r.i"), q.col("x.*")]).fromExpr(req).crossJoinLateral(q.sub(page).alias("x")).orderBy("r.i")
+    check(
+        sel(batch, PG),
+        "SELECT \"r\".\"i\", \"x\".* FROM unnest(CAST($1 AS int4[]), CAST($2 AS text[])) AS \"r\"(\"i\", \"k\") CROSS JOIN LATERAL (SELECT \"a\".\"id\" FROM \"articles\" AS \"a\" WHERE \"a\".\"slug\" = \"r\".\"k\" LIMIT $3) AS \"x\" ORDER BY \"r\".\"i\""
+    )
+    check(sel(batch, LITE), "error: SQLite has no LATERAL joins")
+    let left: q.Select = q.from("articles a").leftJoinLateral(q.sub(q.from("comments c").where(q.col("c.article_id").eq(q.col("a.id")))).alias("c"), q.boolean(true))
+    check(
+        sel(left, PG),
+        "SELECT * FROM \"articles\" AS \"a\" LEFT JOIN LATERAL (SELECT * FROM \"comments\" AS \"c\" WHERE \"c\".\"article_id\" = \"a\".\"id\") AS \"c\" ON TRUE"
+    )
+    check(
+        sel(q.from("a").joinLateral(q.sub(q.from("b")).alias("b"), q.boolean(true)), MY),
+        "SELECT * FROM `a` JOIN LATERAL (SELECT * FROM `b`) AS `b` ON TRUE"
+    )
+
+    let mat: q.Select = q.from("r").withMaterialized("r", q.from("orders"))
+    check(sel(mat, PG), "WITH \"r\" AS MATERIALIZED (SELECT * FROM \"orders\") SELECT * FROM \"r\"")
+    check(sel(mat, LITE), "WITH \"r\" AS MATERIALIZED (SELECT * FROM \"orders\") SELECT * FROM \"r\"")
+    check(sel(mat, MY), "error: MySQL has no MATERIALIZED common table expressions")
+    check(
+        sel(q.from("r").with("a", q.from("x")).withMaterialized("r", q.from("y")), PG),
+        "WITH \"a\" AS (SELECT * FROM \"x\"), \"r\" AS MATERIALIZED (SELECT * FROM \"y\") SELECT * FROM \"r\""
+    )
+
+    let tags: q.Expr = q.arrayOf(q.from("tags t").columns(["t.name"]).orderByExpr(q.raw("1"))).alias("tag_list")
+    check(sel(q.select([tags]), PG), "SELECT ARRAY(SELECT \"t\".\"name\" FROM \"tags\" AS \"t\" ORDER BY 1) AS \"tag_list\"")
+    check(sel(q.select([tags]), MY), "error: ARRAY(SELECT ...) is Postgres only")
+    let noColumns: string[] = []
+    check(sel(q.select([q.call("unnest", [q.param("a")]).aliasColumns("t", noColumns)]), PG), "error: aliasColumns needs at least one column")
+    check(sel(q.select([q.param("a").cast("int4[]")]), PG), "SELECT CAST($1 AS int4[])")
+    check(sel(q.select([q.param("a").cast("int4[]x")]), PG), "error: 'int4[]x' is not a type name")
+    check(sel(q.select([q.param("a").cast("int4]")]), PG), "error: 'int4]' is not a type name")
+    check(sel(q.select([q.param("a").cast("[]")]), PG), "error: '[]' is not a type name")
+    check(sel(q.select([q.param("a").cast("text[][]")]), PG), "SELECT CAST($1 AS text[][])")
+
+    try {
+        let built: q.Query = q.from("users").where(q.col("id").eq(q.param("id")).or(q.col("boss").eq(q.param("id")))).where(q.col("team").eq(q.param("team"))).build(PG)
+        assert(built.slots("id").len() == 1 && built.slots("id")[0] == 1)
+        assert(built.slots("team").len() == 1 && built.slots("team")[0] == 2)
+        assert(built.slots("none").len() == 0)
+        let lite: q.Query = q.from("users").where(q.col("id").eq(q.param("id")).or(q.col("boss").eq(q.param("id")))).build(LITE)
+        assert(lite.slots("id").len() == 2 && lite.slots("id")[1] == 2)
+    } catch (e: q.QueryError) {
+        fmt.println("slots: " + e.message)
+        assert(false)
+    }
+}
+
 fn main(): void {
     selects()
     conditions()
     shapes()
     subqueries()
+    laterals()
     expressions()
     quoting()
     params()

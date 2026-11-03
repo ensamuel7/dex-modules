@@ -1,0 +1,1346 @@
+// dexdns: a domain's records at a DNS provider -- Cloudflare, Hetzner, or a
+// PowerDNS Authoritative server -- behind one interface.
+//
+// A Record is provider-neutral: names in full, lowercase, without the trailing
+// dot; hostnames in content likewise; TXT as the whole unquoted text; MX and SRV
+// with their priority apart from the content. Each provider turns that into its
+// own wire form and back, so a record read from one compares equal, with
+// sameValue, to the record it was written from.
+//
+// Two ways to write. `replace` makes a name and type hold exactly the records
+// given. `update` adds some values and drops others, and leaves every other
+// value at that name and type alone: how a program edits only the records it
+// made -- its SPF beside a user's site-verification TXT at the apex -- while
+// keeping a note of what it made itself. Neither compares TTL or proxying: an
+// existing record with the same value is kept as it is.
+//
+// Every call is one or a few HTTP requests. A method returning string returns
+// "" when done and the provider's reason otherwise; a Zone or a Listing carries
+// its reason in `problem`.
+
+import "http"
+import "json"
+import "num"
+import "str"
+
+struct Record {
+    name: string
+    type: string
+    content: string
+    ttl: int
+    priority: int
+    proxied: bool
+}
+
+// What a provider says of a zone it found or made. `ref` is the provider's id
+// for it; `nameservers` space-separated, where the registrar should point.
+struct Zone {
+    ref: string
+    nameservers: string
+    status: string
+    problem: string
+}
+
+struct Listing {
+    records: Record[]
+    problem: string
+}
+
+interface Provider {
+    fn kind(): string
+
+    // The zone for `domain`, made when the account has none.
+    fn zone(domain: string): Zone
+
+    // The records at `name` of `type`; type "" is every type at name, name ""
+    // the whole zone.
+    fn list(z: Zone, domain: string, name: string, type: string): Listing
+
+    // `name` and `type` hold exactly `records` afterwards; none removes them.
+    fn replace(z: Zone, domain: string, name: string, type: string, records: Record[]): string
+
+    // `drop` removed and `add` added at `name` and `type`, everything else there kept.
+    fn update(z: Zone, domain: string, name: string, type: string, add: Record[], drop: Record[]): string
+
+    // The domain is no longer the caller's: a PowerDNS server drops the zone;
+    // at Cloudflare and Hetzner it stays the account's.
+    fn forget(z: Zone, domain: string): string
+}
+
+// The TTL a record given 0 is written with.
+const DEFAULT_TTL: int = 300
+
+// Cloudflare's API v4 with an API token (Zone: DNS edit; Zone: edit as well to
+// add a domain the account does not have yet). Records are DNS only unless a
+// record asks to be proxied. `comment`, when set, is written on every record
+// made, so a person in the dashboard can tell whose they are.
+struct Cloudflare {
+    api: string
+    token: string
+    comment: string
+
+    fn kind(): string {
+        return "cloudflare"
+    }
+
+    fn zone(domain: string): Zone {
+        let r: http.HttpResponse = call("GET", "/zones?name=" + urlEscape(domain), "")
+
+        if (r.statusCode != 200) {
+            return Zone { problem: cfProblem(r) }
+        }
+
+        let doc: json.Value = json.decode(r.body)
+        let found: json.Value = doc["result"]
+
+        if (found.len() > 0) {
+            return cfZone(found[0])
+        }
+
+        let accounts: http.HttpResponse = call("GET", "/accounts?per_page=5", "")
+        let listed: json.Value = json.decode(accounts.body)
+        let account: string = listed["result"][0]["id"].asString()
+
+        if (accounts.statusCode != 200 || account.isEmpty()) {
+            return Zone {
+                problem: "Cloudflare has no zone " +
+                domain +
+                " this token can see, and the token cannot add one; add the domain in Cloudflare first"
+            }
+        }
+
+        let made: http.HttpResponse = call(
+            "POST",
+            "/zones",
+            json.encode({ name: domain, type: "full", account: { id: account } })
+        )
+
+        if (made.statusCode != 200) {
+            return Zone { problem: cfProblem(made) }
+        }
+
+        let madeDoc: json.Value = json.decode(made.body)
+        return cfZone(madeDoc["result"])
+    }
+
+    // Records are named in full here, so the domain is not needed.
+    #[allow(unused)]
+    fn list(z: Zone, domain: string, name: string, type: string): Listing {
+        let found: Record[] = []
+        let ids: string[] = []
+        let problem: string = fetch(z, name, type, found, ids)
+        return Listing { records: found, problem: problem }
+    }
+
+    // Records are named in full here, so the domain is not needed.
+    #[allow(unused)]
+    fn replace(z: Zone, domain: string, name: string, type: string, records: Record[]): string {
+        if (type.isEmpty()) {
+            return "replace needs a record type"
+        }
+
+        let found: Record[] = []
+        let ids: string[] = []
+        let problem: string = fetch(z, name, type, found, ids)
+
+        if (!problem.isEmpty()) {
+            return problem
+        }
+
+        let kept: Record[] = []
+
+        for (let i: int = 0; i < found.len(); i++) {
+            if (holds(records, found[i]) && !holds(kept, found[i])) {
+                kept.push(found[i])
+                continue
+            }
+
+            let gone: string = remove(z, ids[i])
+
+            if (!gone.isEmpty()) {
+                return gone
+            }
+        }
+
+        foreach (records as want) {
+            if (holds(kept, want)) {
+                continue
+            }
+
+            let made: string = create(z, name, type, want)
+
+            if (!made.isEmpty()) {
+                return made
+            }
+
+            kept.push(want)
+        }
+
+        return ""
+    }
+
+    // Records are named in full here, so the domain is not needed.
+    #[allow(unused)]
+    fn update(z: Zone, domain: string, name: string, type: string, add: Record[], drop: Record[]): string {
+        if (type.isEmpty()) {
+            return "update needs a record type"
+        }
+
+        let found: Record[] = []
+        let ids: string[] = []
+        let problem: string = fetch(z, name, type, found, ids)
+
+        if (!problem.isEmpty()) {
+            return problem
+        }
+
+        let present: Record[] = []
+
+        for (let i: int = 0; i < found.len(); i++) {
+            if (holds(drop, found[i]) && !holds(add, found[i])) {
+                let gone: string = remove(z, ids[i])
+
+                if (!gone.isEmpty()) {
+                    return gone
+                }
+
+                continue
+            }
+
+            present.push(found[i])
+        }
+
+        foreach (add as want) {
+            if (holds(present, want)) {
+                continue
+            }
+
+            let made: string = create(z, name, type, want)
+
+            if (!made.isEmpty()) {
+                return made
+            }
+
+            present.push(want)
+        }
+
+        return ""
+    }
+
+    // The interface passes the zone and domain; at Cloudflare the zone stays the account's.
+    #[allow(unused)]
+    fn forget(z: Zone, domain: string): string {
+        return ""
+    }
+
+    // Every record at name and type, page by page, with Cloudflare's ids beside them.
+    fn fetch(z: Zone, name: string, type: string, found: Record[], ids: string[]): string {
+        let query: string = "?per_page=100"
+
+        if (!name.isEmpty()) {
+            query = query + "&name=" + urlEscape(bare(name))
+        }
+
+        if (!type.isEmpty()) {
+            query = query + "&type=" + urlEscape(type.toUpper())
+        }
+
+        let page: int = 1
+
+        while (true) {
+            let r: http.HttpResponse =
+                call("GET", "/zones/" + z.ref + "/dns_records" + query + "&page=" + str.fromInt(page), "")
+
+            if (r.statusCode != 200) {
+                return cfProblem(r)
+            }
+
+            let doc: json.Value = json.decode(r.body)
+            let result: json.Value = doc["result"]
+
+            for (let i: int = 0; i < result.len(); i++) {
+                found.push(cfRecord(result[i]))
+                ids.push(result[i]["id"].asString())
+            }
+
+            let pages: int = doc["result_info"]["total_pages"].asInt()
+
+            if (page >= pages) {
+                return ""
+            }
+
+            page = page + 1
+        }
+
+        return ""
+    }
+
+    fn create(z: Zone, name: string, type: string, r: Record): string {
+        let made: http.HttpResponse = call("POST", "/zones/" + z.ref + "/dns_records", cfBody(name, type, r, comment))
+
+        if (made.statusCode != 200) {
+            return cfProblem(made)
+        }
+
+        return ""
+    }
+
+    fn remove(z: Zone, id: string): string {
+        let gone: http.HttpResponse = call("DELETE", "/zones/" + z.ref + "/dns_records/" + id, "")
+
+        if (gone.statusCode != 200 && gone.statusCode != 404) {
+            return cfProblem(gone)
+        }
+
+        return ""
+    }
+
+    fn call(method: string, path: string, body: string): http.HttpResponse {
+        let headers: string = http.header("", "Authorization", "Bearer " + token)
+        headers = http.header(headers, "Content-Type", "application/json")
+        let options: http.HttpOptions = http.HttpOptions { timeoutMs: 20000, connectTimeoutMs: 5000 }
+        return http.requestWith(method, api + path, body, headers, options)
+    }
+}
+
+// Hetzner's DNS, in the Cloud API since 2025: zones and RRsets, the same token
+// as servers. An RRset is a name and type with all its records, so setting one
+// is one call. `comment`, when set, is written on every record.
+struct Hetzner {
+    api: string
+    token: string
+    comment: string
+
+    fn kind(): string {
+        return "hetzner"
+    }
+
+    fn zone(domain: string): Zone {
+        let r: http.HttpResponse = call("GET", "/zones?name=" + urlEscape(domain), "")
+
+        if (r.statusCode != 200) {
+            return Zone { problem: hzProblem(r) }
+        }
+
+        let doc: json.Value = json.decode(r.body)
+        let found: json.Value = doc["zones"]
+
+        if (found.len() > 0) {
+            return hzZone(found[0])
+        }
+
+        let made: http.HttpResponse = call("POST", "/zones", json.encode({ name: domain, mode: "primary" }))
+
+        if (made.statusCode != 201 && made.statusCode != 200) {
+            return Zone { problem: hzProblem(made) }
+        }
+
+        let madeDoc: json.Value = json.decode(made.body)
+        return hzZone(madeDoc["zone"])
+    }
+
+    fn list(z: Zone, domain: string, name: string, type: string): Listing {
+        let found: Record[] = []
+
+        if (!name.isEmpty() && !type.isEmpty()) {
+            let one: http.HttpResponse = call("GET", rrsetPath(z, domain, name, type), "")
+
+            if (one.statusCode == 404) {
+                return Listing { records: found, problem: "" }
+            }
+
+            if (one.statusCode != 200) {
+                return Listing { records: found, problem: hzProblem(one) }
+            }
+
+            let doc: json.Value = json.decode(one.body)
+            hzRecords(doc["rrset"], domain, found)
+            return Listing { records: found, problem: "" }
+        }
+
+        let query: string = "?per_page=100"
+
+        if (!name.isEmpty()) {
+            query = query + "&name=" + urlEscape(relative(bare(name), domain))
+        }
+
+        if (!type.isEmpty()) {
+            query = query + "&type=" + urlEscape(type.toUpper())
+        }
+
+        let page: int = 1
+
+        while (true) {
+            let r: http.HttpResponse =
+                call("GET", "/zones/" + z.ref + "/rrsets" + query + "&page=" + str.fromInt(page), "")
+
+            if (r.statusCode != 200) {
+                return Listing { records: found, problem: hzProblem(r) }
+            }
+
+            let doc: json.Value = json.decode(r.body)
+            let sets: json.Value = doc["rrsets"]
+
+            for (let i: int = 0; i < sets.len(); i++) {
+                hzRecords(sets[i], domain, found)
+            }
+
+            let next: int = doc["meta"]["pagination"]["next_page"].asInt()
+
+            if (next <= page) {
+                return Listing { records: found, problem: "" }
+            }
+
+            page = next
+        }
+
+        return Listing { records: found, problem: "" }
+    }
+
+    fn replace(z: Zone, domain: string, name: string, type: string, records: Record[]): string {
+        if (type.isEmpty()) {
+            return "replace needs a record type"
+        }
+
+        let path: string = rrsetPath(z, domain, name, type)
+
+        if (records.len() == 0) {
+            let r: http.HttpResponse = call("DELETE", path, "")
+
+            if (r.statusCode == 200 || r.statusCode == 201 || r.statusCode == 204 || r.statusCode == 404) {
+                return ""
+            }
+
+            return hzProblem(r)
+        }
+
+        let values: string = hzValues(type, records, comment)
+        let now: http.HttpResponse = call("GET", path, "")
+
+        if (now.statusCode == 404) {
+            let body: string = "{\"name\":" + quoted(
+                relative(bare(name), domain)
+            ) + ",\"type\":" + quoted(
+                type.toUpper()
+            ) + ",\"ttl\":" + str.fromInt(ttlOf(records)) + ",\"records\":" + values + "}"
+            let made: http.HttpResponse = call("POST", "/zones/" + z.ref + "/rrsets", body)
+
+            if (made.statusCode != 201 && made.statusCode != 200) {
+                return hzProblem(made)
+            }
+
+            return ""
+        }
+
+        if (now.statusCode != 200) {
+            return hzProblem(now)
+        }
+
+        let set: http.HttpResponse = call("POST", path + "/actions/set_records", "{\"records\":" + values + "}")
+
+        if (set.statusCode != 201 && set.statusCode != 200) {
+            return hzProblem(set)
+        }
+
+        return ""
+    }
+
+    fn update(z: Zone, domain: string, name: string, type: string, add: Record[], drop: Record[]): string {
+        if (type.isEmpty()) {
+            return "update needs a record type"
+        }
+
+        let now: Listing = list(z, domain, name, type)
+
+        if (!now.problem.isEmpty()) {
+            return now.problem
+        }
+
+        let merged: Record[] = merge(now.records, add, drop)
+
+        if (sameSet(merged, now.records)) {
+            return ""
+        }
+
+        return replace(z, domain, name, type, merged)
+    }
+
+    // The interface passes the zone and domain; at Hetzner the zone stays the account's.
+    #[allow(unused)]
+    fn forget(z: Zone, domain: string): string {
+        return ""
+    }
+
+    fn rrsetPath(z: Zone, domain: string, name: string, type: string): string {
+        return "/zones/" +
+            z.ref +
+            "/rrsets/" +
+            urlEscape(relative(bare(name), domain)) +
+            "/" +
+            urlEscape(type.toUpper())
+    }
+
+    fn call(method: string, path: string, body: string): http.HttpResponse {
+        let headers: string = http.header("", "Authorization", "Bearer " + token)
+        headers = http.header(headers, "Content-Type", "application/json")
+        let options: http.HttpOptions = http.HttpOptions { timeoutMs: 20000, connectTimeoutMs: 5000 }
+        return http.requestWith(method, api + path, body, headers, options)
+    }
+}
+
+// A PowerDNS Authoritative server driven over its HTTP API. `api` is the
+// server's base, such as http://127.0.0.1:8081/api/v1/servers/localhost;
+// `nameservers` the names a registrar is pointed at, space-separated, such as
+// "ns1.example.net ns2.example.net"; `label` how its problems name it, such as
+// "DexRail's nameserver".
+struct PowerDns {
+    api: string
+    key: string
+    nameservers: string
+    label: string
+
+    fn kind(): string {
+        return "powerdns"
+    }
+
+    fn zone(domain: string): Zone {
+        if (api.isEmpty() || nameservers.isEmpty()) {
+            return Zone { problem: label + " is not set up: it needs an API address and nameservers" }
+        }
+
+        let r: http.HttpResponse = call("GET", "/zones/" + urlEscape(domain + "."), "")
+
+        if (r.statusCode == 200) {
+            return Zone { ref: domain + ".", nameservers: nameservers, status: "", problem: "" }
+        }
+
+        if (r.statusCode != 404 && r.statusCode != 422) {
+            return Zone { problem: problem(r) }
+        }
+
+        let servers: string[] = nameservers.split(" ")
+        let dotted: string = "["
+
+        for (let i: int = 0; i < servers.len(); i++) {
+            if (i > 0) {
+                dotted = dotted + ","
+            }
+
+            dotted = dotted + quoted(servers[i] + ".")
+        }
+
+        dotted = dotted + "]"
+        // DEFAULT moves the SOA serial on with every change the API makes, so secondaries notice.
+        let body: string =
+            "{\"name\":" +
+            quoted(domain + ".") +
+            ",\"kind\":\"Native\",\"soa_edit_api\":\"DEFAULT\"," +
+            "\"nameservers\":" +
+            dotted +
+            "}"
+        let made: http.HttpResponse = call("POST", "/zones", body)
+
+        if (made.statusCode != 201) {
+            return Zone { problem: problem(made) }
+        }
+
+        return Zone { ref: domain + ".", nameservers: nameservers, status: "", problem: "" }
+    }
+
+    // The zone holds full names, so the domain is not needed.
+    #[allow(unused)]
+    fn list(z: Zone, domain: string, name: string, type: string): Listing {
+        let found: Record[] = []
+        let r: http.HttpResponse = call("GET", "/zones/" + urlEscape(z.ref), "")
+
+        if (r.statusCode != 200) {
+            return Listing { records: found, problem: problem(r) }
+        }
+
+        let doc: json.Value = json.decode(r.body)
+        let sets: json.Value = doc["rrsets"]
+        let wantName: string = bare(name)
+        let wantType: string = type.toUpper()
+
+        for (let i: int = 0; i < sets.len(); i++) {
+            let set: json.Value = sets[i]
+            let setName: string = bare(set["name"].asString())
+            let setType: string = set["type"].asString()
+
+            if (!wantName.isEmpty() && setName != wantName) {
+                continue
+            }
+
+            if (!wantType.isEmpty() && setType != wantType) {
+                continue
+            }
+
+            let ttl: int = set["ttl"].asInt()
+            let rows: json.Value = set["records"]
+
+            for (let j: int = 0; j < rows.len(); j++) {
+                if (rows[j]["disabled"].asBool()) {
+                    continue
+                }
+
+                found.push(fromWire(setName, setType, rows[j]["content"].asString(), ttl))
+            }
+        }
+
+        return Listing { records: found, problem: "" }
+    }
+
+    // The zone holds full names, so the domain is not needed.
+    #[allow(unused)]
+    fn replace(z: Zone, domain: string, name: string, type: string, records: Record[]): string {
+        if (type.isEmpty()) {
+            return "replace needs a record type"
+        }
+
+        if (records.len() == 0) {
+            return patch(z, name, type, "\"changetype\":\"DELETE\"")
+        }
+
+        let rows: string = "["
+
+        for (let i: int = 0; i < records.len(); i++) {
+            if (i > 0) {
+                rows = rows + ","
+            }
+
+            rows = rows + "{\"content\":" + quoted(toWire(type, records[i])) + ",\"disabled\":false}"
+        }
+
+        rows = rows + "]"
+        return patch(
+            z,
+            name,
+            type,
+            "\"changetype\":\"REPLACE\",\"ttl\":" + str.fromInt(ttlOf(records)) + ",\"records\":" + rows
+        )
+    }
+
+    fn update(z: Zone, domain: string, name: string, type: string, add: Record[], drop: Record[]): string {
+        if (type.isEmpty()) {
+            return "update needs a record type"
+        }
+
+        let now: Listing = list(z, domain, name, type)
+
+        if (!now.problem.isEmpty()) {
+            return now.problem
+        }
+
+        let merged: Record[] = merge(now.records, add, drop)
+
+        if (sameSet(merged, now.records)) {
+            return ""
+        }
+
+        return replace(z, domain, name, type, merged)
+    }
+
+    // The interface passes the domain; the zone's ref names it.
+    #[allow(unused)]
+    fn forget(z: Zone, domain: string): string {
+        let r: http.HttpResponse = call("DELETE", "/zones/" + urlEscape(z.ref), "")
+
+        if (r.statusCode == 204 || r.statusCode == 404 || r.statusCode == 422) {
+            return ""
+        }
+
+        return problem(r)
+    }
+
+    fn patch(z: Zone, name: string, type: string, change: string): string {
+        let body: string =
+            "{\"rrsets\":[{\"name\":" +
+            quoted(bare(name) + ".") +
+            ",\"type\":" +
+            quoted(type.toUpper()) +
+            "," +
+            change +
+            "}]}"
+        let r: http.HttpResponse = call("PATCH", "/zones/" + urlEscape(z.ref), body)
+
+        if (r.statusCode == 204 || r.statusCode == 200) {
+            return ""
+        }
+
+        return problem(r)
+    }
+
+    fn problem(r: http.HttpResponse): string {
+        if (r.statusCode == 0) {
+            return label + " did not answer"
+        }
+
+        let doc: json.Value = json.decode(r.body)
+        let message: string = doc["error"].asString()
+
+        if (message.isEmpty()) {
+            return label + " answered " + str.fromInt(r.statusCode)
+        }
+
+        return label + ": " + message
+    }
+
+    fn call(method: string, path: string, body: string): http.HttpResponse {
+        let headers: string = http.header("", "X-API-Key", key)
+        headers = http.header(headers, "Content-Type", "application/json")
+        let options: http.HttpOptions = http.HttpOptions { timeoutMs: 10000, connectTimeoutMs: 3000 }
+        return http.requestWith(method, api + path, body, headers, options)
+    }
+}
+
+fn cloudflare(api: string, token: string): Cloudflare {
+    return Cloudflare { api: api, token: token, comment: "" }
+}
+
+fn hetzner(api: string, token: string): Hetzner {
+    return Hetzner { api: api, token: token, comment: "" }
+}
+
+fn powerdns(api: string, key: string, nameservers: string, label: string): PowerDns {
+    return PowerDns { api: api, key: key, nameservers: nameservers, label: label }
+}
+
+// ---- Records, compared and merged ----
+
+// The record in its neutral form: names and hostnames lowercase without the
+// trailing dot, the type in capitals.
+fn normal(r: Record): Record {
+    let type: string = r.type.toUpper()
+    let content: string = r.content.trim()
+
+    if (type == "CNAME" || type == "NS" || type == "MX" || type == "PTR") {
+        content = bare(content)
+    } else if (type == "SRV") {
+        let parts: string[] = words(content)
+
+        if (parts.len() == 3) {
+            content = parts[0] + " " + parts[1] + " " + bare(parts[2])
+        }
+    }
+
+    return Record {
+        name: bare(r.name),
+        type: type,
+        content: content,
+        ttl: r.ttl,
+        priority: r.priority,
+        proxied: r.proxied
+    }
+}
+
+// The same value: type, content and, for MX and SRV, priority. Hostnames
+// compare without regard to case or a trailing dot; TXT exactly.
+fn sameValue(a: Record, b: Record): bool {
+    let x: Record = normal(a)
+    let y: Record = normal(b)
+
+    if (x.type != y.type || x.content != y.content) {
+        return false
+    }
+
+    if (x.type == "MX" || x.type == "SRV") {
+        return x.priority == y.priority
+    }
+
+    return true
+}
+
+fn holds(records: Record[], r: Record): bool {
+    foreach (records as it) {
+        if (sameValue(it, r)) {
+            return true
+        }
+    }
+
+    return false
+}
+
+// What an RRset holds after an update: `now` without `drop`, then `add`, each value once.
+// A value both dropped and added stays.
+fn merge(now: Record[], add: Record[], drop: Record[]): Record[] {
+    let out: Record[] = []
+
+    foreach (now as r) {
+        if (holds(drop, r) && !holds(add, r)) {
+            continue
+        }
+
+        if (!holds(out, r)) {
+            out.push(r)
+        }
+    }
+
+    foreach (add as r) {
+        if (!holds(out, r)) {
+            out.push(r)
+        }
+    }
+
+    return out
+}
+
+fn sameSet(a: Record[], b: Record[]): bool {
+    if (a.len() != b.len()) {
+        return false
+    }
+
+    foreach (a as r) {
+        if (!holds(b, r)) {
+            return false
+        }
+    }
+
+    return true
+}
+
+// One TTL for an RRset: the largest asked for, or DEFAULT_TTL when none is.
+fn ttlOf(records: Record[]): int {
+    let ttl: int = 0
+
+    foreach (records as r) {
+        if (r.ttl > ttl) {
+            ttl = r.ttl
+        }
+    }
+
+    if (ttl <= 0) {
+        return DEFAULT_TTL
+    }
+
+    return ttl
+}
+
+// ---- Wire forms ----
+
+// The record's content as a zone file has it, which PowerDNS and Hetzner take:
+// hostnames with the trailing dot, MX and SRV led by their priority, TXT quoted
+// in pieces of at most 255 bytes.
+fn toWire(type: string, r: Record): string {
+    let n: Record = normal(Record { name: r.name, type: type, content: r.content, ttl: r.ttl, priority: r.priority })
+
+    if (n.type == "TXT" || n.type == "SPF") {
+        return txtQuote(n.content)
+    }
+
+    if (n.type == "CNAME" || n.type == "NS" || n.type == "PTR") {
+        return dotted(n.content)
+    }
+
+    if (n.type == "MX") {
+        return str.fromInt(n.priority) + " " + dotted(n.content)
+    }
+
+    if (n.type == "SRV") {
+        let parts: string[] = words(n.content)
+
+        if (parts.len() == 3) {
+            return str.fromInt(n.priority) + " " + parts[0] + " " + parts[1] + " " + dotted(parts[2])
+        }
+    }
+
+    return n.content
+}
+
+// A record from zone-file content, the inverse of toWire.
+fn fromWire(name: string, type: string, content: string, ttl: int): Record {
+    let t: string = type.toUpper()
+    let text: string = content.trim()
+    let priority: int = 0
+
+    if (t == "TXT" || t == "SPF") {
+        text = txtUnquote(text)
+    } else if (t == "MX" || t == "SRV") {
+        let parts: string[] = words(text)
+
+        if (parts.len() >= 2) {
+            priority = str.toInt(parts[0])
+            text = ""
+
+            for (let i: int = 1; i < parts.len(); i++) {
+                if (i > 1) {
+                    text = text + " "
+                }
+
+                text = text + parts[i]
+            }
+        }
+    }
+
+    return normal(Record { name: name, type: t, content: text, ttl: ttl, priority: priority, proxied: false })
+}
+
+// TXT text as quoted strings of at most 255 bytes each, the most one string
+// in a TXT record may hold: a 2048-bit DKIM key is about 400. Quotes and
+// backslashes inside are escaped.
+fn txtQuote(text: string): string {
+    if (text.isEmpty()) {
+        return "\"\""
+    }
+
+    let out: string = ""
+    let start: int = 0
+
+    while (start < text.len()) {
+        let end: int = start + 255
+
+        if (end > text.len()) {
+            end = text.len()
+        }
+
+        if (!out.isEmpty()) {
+            out = out + " "
+        }
+
+        out = out + "\"" + txtEscape(text.substring(start, end)) + "\""
+        start = end
+    }
+
+    return out
+}
+
+fn txtEscape(piece: string): string {
+    let out: string = ""
+
+    for (let i: int = 0; i < piece.len(); i++) {
+        let c: char = piece.charAt(i)
+
+        if (c == '"' || c == '\\') {
+            out = out + "\\"
+        }
+
+        out = out + piece.substring(i, i + 1)
+    }
+
+    return out
+}
+
+// The text of quoted TXT strings joined back into one, undoing \" \\ and
+// \DDD escapes. Text with no quotes is taken as it stands.
+fn txtUnquote(wire: string): string {
+    let text: string = wire.trim()
+
+    if (!text.startsWith("\"")) {
+        return text
+    }
+
+    let out: string = ""
+    let inside: bool = false
+    let i: int = 0
+
+    while (i < text.len()) {
+        let c: char = text.charAt(i)
+
+        if (!inside) {
+            if (c == '"') {
+                inside = true
+            }
+
+            i = i + 1
+            continue
+        }
+
+        if (c == '"') {
+            inside = false
+            i = i + 1
+            continue
+        }
+
+        if (c == '\\' && i + 1 < text.len()) {
+            let d: char = text.charAt(i + 1)
+
+            if (d >= '0' && d <= '9' && i + 3 < text.len()) {
+                let code: int = str.toInt(text.substring(i + 1, i + 4))
+                let ch: char = num.toChar(code)
+                out = out + "${ch}"
+                i = i + 4
+                continue
+            }
+
+            out = out + text.substring(i + 1, i + 2)
+            i = i + 2
+            continue
+        }
+
+        out = out + text.substring(i, i + 1)
+        i = i + 1
+    }
+
+    return out
+}
+
+// ---- Cloudflare's shapes ----
+
+fn cfZone(z: json.Value): Zone {
+    let servers: json.Value = z["name_servers"]
+    let names: string[] = []
+
+    for (let i: int = 0; i < servers.len(); i++) {
+        names.push(servers[i].asString())
+    }
+
+    return Zone { ref: z["id"].asString(), nameservers: spaced(names), status: z["status"].asString(), problem: "" }
+}
+
+// Cloudflare names in full and without the trailing dot, and keeps priority
+// apart; SRV and CAA are clearest from their structured `data`.
+fn cfRecord(v: json.Value): Record {
+    let type: string = v["type"].asString()
+    let content: string = v["content"].asString()
+    let priority: int = v["priority"].asInt()
+    let data: json.Value = v["data"]
+
+    if (type == "TXT") {
+        content = txtUnquote(content)
+    } else if (type == "SRV" && data.isObject()) {
+        priority = data["priority"].asInt()
+        let weight: int = data["weight"].asInt()
+        let port: int = data["port"].asInt()
+        content = str.fromInt(weight) + " " + str.fromInt(port) + " " + data["target"].asString()
+    } else if (type == "SRV") {
+        let parts: string[] = words(content)
+
+        if (parts.len() == 4) {
+            priority = str.toInt(parts[0])
+            content = parts[1] + " " + parts[2] + " " + parts[3]
+        }
+    } else if (type == "CAA" && data.isObject()) {
+        let flags: int = data["flags"].asInt()
+        content = str.fromInt(flags) + " " + data["tag"].asString() + " " + quoted(data["value"].asString())
+    }
+
+    return normal(
+        Record {
+            name: v["name"].asString(),
+            type: type,
+            content: content,
+            ttl: v["ttl"].asInt(),
+            priority: priority,
+            proxied: v["proxied"].asBool()
+        }
+    )
+}
+
+fn cfBody(name: string, type: string, record: Record, comment: string): string {
+    let r: Record = normal(
+        Record {
+            name: name,
+            type: type,
+            content: record.content,
+            ttl: record.ttl,
+            priority: record.priority,
+            proxied: record.proxied
+        }
+    )
+    let ttl: int = r.ttl
+
+    if (ttl <= 0) {
+        ttl = DEFAULT_TTL
+    }
+
+    let body: string = "{\"type\":" + quoted(r.type) + ",\"name\":" + quoted(r.name) + ",\"ttl\":" + str.fromInt(ttl)
+
+    if (r.type == "SRV") {
+        let parts: string[] = words(r.content)
+        let weight: int = 0
+        let port: int = 0
+        let target: string = ""
+
+        if (parts.len() == 3) {
+            weight = str.toInt(parts[0])
+            port = str.toInt(parts[1])
+            target = parts[2]
+        }
+
+        body =
+            body +
+            ",\"data\":{\"priority\":" +
+            str.fromInt(r.priority) +
+            ",\"weight\":" +
+            str.fromInt(weight) +
+            ",\"port\":" +
+            str.fromInt(port) +
+            ",\"target\":" +
+            quoted(target) +
+            "}"
+    } else if (r.type == "CAA") {
+        let parts: string[] = words(r.content)
+        let flags: int = 0
+        let tag: string = ""
+        let value: string = ""
+
+        if (parts.len() >= 3) {
+            flags = str.toInt(parts[0])
+            tag = parts[1]
+            value = txtUnquote(r.content.substring(r.content.indexOf(tag) + tag.len(), r.content.len()))
+        }
+
+        body =
+            body +
+            ",\"data\":{\"flags\":" +
+            str.fromInt(flags) +
+            ",\"tag\":" +
+            quoted(tag) +
+            ",\"value\":" +
+            quoted(value) +
+            "}"
+    } else {
+        body = body + ",\"content\":" + quoted(r.content)
+    }
+
+    if (r.type == "MX") {
+        body = body + ",\"priority\":" + str.fromInt(r.priority)
+    }
+
+    // Only addresses and aliases can sit behind Cloudflare's proxy.
+    let proxiable: bool = r.type == "A" || r.type == "AAAA" || r.type == "CNAME"
+
+    if (proxiable) {
+        if (r.proxied) {
+            body = body + ",\"proxied\":true"
+        } else {
+            body = body + ",\"proxied\":false"
+        }
+    }
+
+    if (!comment.isEmpty()) {
+        body = body + ",\"comment\":" + quoted(comment)
+    }
+
+    return body + "}"
+}
+
+fn cfProblem(r: http.HttpResponse): string {
+    if (r.statusCode == 0) {
+        return "could not reach Cloudflare"
+    }
+
+    let doc: json.Value = json.decode(r.body)
+    let message: string = doc["errors"][0]["message"].asString()
+
+    if (r.statusCode == 401 || r.statusCode == 403) {
+        if (message.isEmpty()) {
+            message = "not allowed"
+        }
+
+        return "Cloudflare refused this token (" + message + "); it needs Zone: DNS edit on the domain"
+    }
+
+    if (message.isEmpty()) {
+        return "Cloudflare answered " + str.fromInt(r.statusCode)
+    }
+
+    return "Cloudflare: " + message
+}
+
+// ---- Hetzner's shapes ----
+
+fn hzZone(z: json.Value): Zone {
+    let assigned: json.Value = z["authoritative_nameservers"]["assigned"]
+    let names: string[] = []
+
+    for (let i: int = 0; i < assigned.len(); i++) {
+        names.push(assigned[i].asString())
+    }
+
+    return Zone {
+        ref: str.fromLong(z["id"].asLong()),
+        nameservers: spaced(names),
+        status: z["authoritative_nameservers"]["delegation_status"].asString(),
+        problem: ""
+    }
+}
+
+// An RRset's records, named in full: Hetzner names them relative to the zone.
+fn hzRecords(set: json.Value, domain: string, into: Record[]): void {
+    let relativeName: string = set["name"].asString()
+    let name: string = domain
+
+    if (relativeName != "@" && !relativeName.isEmpty()) {
+        name = relativeName + "." + domain
+    }
+
+    let type: string = set["type"].asString()
+    let ttl: int = set["ttl"].asInt()
+    let rows: json.Value = set["records"]
+
+    for (let i: int = 0; i < rows.len(); i++) {
+        into.push(fromWire(name, type, rows[i]["value"].asString(), ttl))
+    }
+}
+
+fn hzValues(type: string, records: Record[], comment: string): string {
+    let text: string = "["
+
+    for (let i: int = 0; i < records.len(); i++) {
+        if (i > 0) {
+            text = text + ","
+        }
+
+        text = text + "{\"value\":" + quoted(toWire(type, records[i]))
+
+        if (!comment.isEmpty()) {
+            text = text + ",\"comment\":" + quoted(comment)
+        }
+
+        text = text + "}"
+    }
+
+    return text + "]"
+}
+
+fn hzProblem(r: http.HttpResponse): string {
+    if (r.statusCode == 0) {
+        return "could not reach the Hetzner API"
+    }
+
+    let doc: json.Value = json.decode(r.body)
+    let message: string = doc["error"]["message"].asString()
+
+    if (r.statusCode == 401 || r.statusCode == 403) {
+        return "Hetzner refused this token; it needs read and write access in the project that holds the domain"
+    }
+
+    if (message.isEmpty()) {
+        return "Hetzner answered " + str.fromInt(r.statusCode)
+    }
+
+    return "Hetzner: " + message
+}
+
+// ---- Names ----
+
+// example.com, a.b.example.co.uk: lowercase labels of letters, digits and dashes, at least one dot.
+fn validName(name: string): bool {
+    if (name.len() < 3 || name.len() > 253 || !name.contains(".")) {
+        return false
+    }
+
+    let labels: string[] = name.split(".")
+
+    foreach (labels as l) {
+        if (l.isEmpty() || l.len() > 63 || l.startsWith("-") || l.endsWith("-")) {
+            return false
+        }
+
+        for (let i: int = 0; i < l.len(); i++) {
+            let c: char = l.charAt(i)
+            let ok: bool = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'
+
+            if (!ok) {
+                return false
+            }
+        }
+    }
+
+    return true
+}
+
+// `host` is the domain or a name under it (a.example.com, *.example.com).
+fn under(host: string, domain: string): bool {
+    return host == domain || host.endsWith("." + domain)
+}
+
+// The name relative to the zone: "@" for the domain itself.
+fn relative(host: string, domain: string): string {
+    if (host == domain) {
+        return "@"
+    }
+
+    if (!under(host, domain)) {
+        return host
+    }
+
+    return host.substring(0, host.len() - domain.len() - 1)
+}
+
+// Lowercase, without the trailing dot.
+fn bare(name: string): string {
+    let n: string = name.trim().toLower()
+
+    if (n.endsWith(".")) {
+        return n.substring(0, n.len() - 1)
+    }
+
+    return n
+}
+
+fn dotted(host: string): string {
+    if (host.endsWith(".")) {
+        return host
+    }
+
+    return host + "."
+}
+
+fn words(text: string): string[] {
+    let out: string[] = []
+    let parts: string[] = text.trim().split(" ")
+
+    foreach (parts as p) {
+        if (!p.isEmpty()) {
+            out.push(p)
+        }
+    }
+
+    return out
+}
+
+fn spaced(items: string[]): string {
+    let text: string = ""
+
+    foreach (items as it) {
+        if (!text.isEmpty()) {
+            text = text + " "
+        }
+
+        text = text + it
+    }
+
+    return text
+}
+
+// A JSON string literal: json.encode takes no bare string.
+fn quoted(text: string): string {
+    let one: json.Value = [text]
+    let encoded: string = json.encode(one)
+    return encoded.substring(1, encoded.len() - 1)
+}
+
+// Percent-encoding for a query value or path segment: everything but
+// unreserved characters (RFC 3986) is escaped.
+fn urlEscape(text: string): string {
+    let hex: string = "0123456789ABCDEF"
+    let out: string = ""
+
+    for (let i: int = 0; i < text.len(); i++) {
+        let c: char = text.charAt(i)
+        let keep: bool =
+            (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' ||
+            c == '.' ||
+            c == '_' ||
+            c == '~'
+
+        if (keep) {
+            out = out + text.substring(i, i + 1)
+            continue
+        }
+
+        let b: int = num.toInt(c)
+
+        if (b < 0) {
+            b = b + 256
+        }
+
+        out = out + "%" + hex.substring(b / 16, b / 16 + 1) + hex.substring(b % 16, b % 16 + 1)
+    }
+
+    return out
+}

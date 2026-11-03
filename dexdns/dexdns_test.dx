@@ -1,0 +1,98 @@
+// dexdns without a network: wire forms, comparison and merging.
+// providers_test.dx exercises the providers themselves; see test.sh.
+import "fmt"
+import "github.com/ensamuel7/dex-modules/dexdns"
+
+fn rec(name: string, type: string, content: string, priority: int): dexdns.Record {
+    return dexdns.Record { name: name, type: type, content: content, ttl: 0, priority: priority, proxied: false }
+}
+
+fn main(): void {
+    // Names.
+    assert(dexdns.validName("example.com"))
+    assert(!dexdns.validName("Example.com"))
+    assert(!dexdns.validName("a_b.example.com"))
+    assert(dexdns.under("mail.example.com", "example.com"))
+    assert(!dexdns.under("badexample.com", "example.com"))
+    assert(dexdns.relative("example.com", "example.com") == "@")
+    assert(dexdns.relative("default._domainkey.example.com", "example.com") == "default._domainkey")
+    assert(dexdns.bare("Mail.Example.COM.") == "mail.example.com")
+
+    // TXT: quoted, escaped, and split at 255 bytes; joined back exactly.
+    assert(dexdns.txtQuote("v=spf1 mx -all") == "\"v=spf1 mx -all\"")
+    assert(dexdns.txtQuote("say \"hi\" \\ there") == "\"say \\\"hi\\\" \\\\ there\"")
+    assert(dexdns.txtUnquote(dexdns.txtQuote("say \"hi\" \\ there")) == "say \"hi\" \\ there")
+    assert(dexdns.txtUnquote("unquoted text") == "unquoted text")
+    assert(dexdns.txtUnquote("\"a\" \"b\"") == "ab")
+    assert(dexdns.txtUnquote("\"caf\\195\\169\"") == "café")
+
+    // A 2048-bit DKIM key is about 400 characters: two strings on the wire.
+    let key: string = "v=DKIM1; k=rsa; p="
+    while (key.len() < 410) {
+        key = key + "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+    }
+    let wire: string = dexdns.txtQuote(key)
+    let pieces: string[] = wire.split("\" \"")
+    assert(pieces.len() == 2)
+    assert(pieces[0].len() == 256)
+    assert(dexdns.txtUnquote(wire) == key)
+    let dkim: dexdns.Record = rec("default._domainkey.example.com", "TXT", key, 0)
+    let back: dexdns.Record = dexdns.fromWire("default._domainkey.example.com.", "TXT", dexdns.toWire("TXT", dkim), 300)
+    assert(back.content == key)
+    assert(back.name == "default._domainkey.example.com")
+    assert(dexdns.sameValue(back, dkim))
+
+    // MX and SRV: priority apart in the neutral form, in front on the wire.
+    let mx: dexdns.Record = rec("example.com", "MX", "Mail.Example.com.", 10)
+    assert(dexdns.toWire("MX", mx) == "10 mail.example.com.")
+    let mxBack: dexdns.Record = dexdns.fromWire("example.com.", "MX", "10 mail.example.com.", 300)
+    assert(mxBack.priority == 10 && mxBack.content == "mail.example.com")
+    assert(dexdns.sameValue(mx, mxBack))
+    assert(!dexdns.sameValue(mx, rec("example.com", "MX", "mail.example.com", 20)))
+
+    let srv: dexdns.Record = rec("_imaps._tcp.example.com", "SRV", "1 993 mail.example.com", 0)
+    assert(dexdns.toWire("SRV", srv) == "0 1 993 mail.example.com.")
+    let srvBack: dexdns.Record = dexdns.fromWire("_imaps._tcp.example.com", "SRV", "0 1 993 mail.example.com.", 300)
+    assert(srvBack.content == "1 993 mail.example.com" && srvBack.priority == 0)
+    assert(dexdns.sameValue(srv, srvBack))
+
+    assert(dexdns.toWire("CNAME", rec("www.example.com", "CNAME", "example.com", 0)) == "example.com.")
+    assert(dexdns.toWire("A", rec("example.com", "A", "203.0.113.5", 0)) == "203.0.113.5")
+    assert(dexdns.toWire("CAA", rec("example.com", "CAA", "0 issue \"letsencrypt.org\"", 0)) == "0 issue \"letsencrypt.org\"")
+
+    // TXT compares exactly; hostnames without regard to case.
+    assert(!dexdns.sameValue(rec("a.example.com", "TXT", "Hello", 0), rec("a.example.com", "TXT", "hello", 0)))
+    assert(dexdns.sameValue(rec("a.example.com", "cname", "B.example.com.", 0), rec("a.example.com", "CNAME", "b.example.com", 0)))
+    assert(!dexdns.sameValue(rec("a.example.com", "A", "1.2.3.4", 0), rec("a.example.com", "AAAA", "1.2.3.4", 0)))
+
+    // Merging: what was dropped goes, what was added comes, the rest stays.
+    let spf: dexdns.Record = rec("example.com", "TXT", "v=spf1 mx -all", 0)
+    let oldSpf: dexdns.Record = rec("example.com", "TXT", "v=spf1 a -all", 0)
+    let google: dexdns.Record = rec("example.com", "TXT", "google-site-verification=abc", 0)
+    let now: dexdns.Record[] = [google, oldSpf]
+    let add: dexdns.Record[] = [spf]
+    let drop: dexdns.Record[] = [oldSpf]
+    let merged: dexdns.Record[] = dexdns.merge(now, add, drop)
+    assert(merged.len() == 2)
+    assert(dexdns.holds(merged, google))
+    assert(dexdns.holds(merged, spf))
+    assert(!dexdns.holds(merged, oldSpf))
+    // Adding what is there already, or dropping what is not, changes nothing.
+    let again: dexdns.Record[] = dexdns.merge(merged, add, [rec("example.com", "TXT", "never there", 0)])
+    assert(dexdns.sameSet(again, merged))
+    // Dropped and added at once: it stays.
+    let both: dexdns.Record[] = dexdns.merge([spf], [spf], [spf])
+    assert(both.len() == 1)
+
+    // TTLs: the largest asked for, or the default.
+    assert(dexdns.ttlOf(merged) == dexdns.DEFAULT_TTL)
+    let slow: dexdns.Record = dexdns.Record { name: "example.com", type: "MX", content: "mail.example.com", ttl: 3600, priority: 10, proxied: false }
+    assert(dexdns.ttlOf([slow, mx]) == 3600)
+
+    // URL escaping.
+    assert(dexdns.urlEscape("a.b-c_d~e") == "a.b-c_d~e")
+    assert(dexdns.urlEscape("@") == "%40")
+    assert(dexdns.urlEscape("x y&z") == "x%20y%26z")
+
+    fmt.println("dexdns_test: all assertions passed")
+}

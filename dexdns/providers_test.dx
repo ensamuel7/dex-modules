@@ -1,0 +1,158 @@
+// The providers themselves, through the Provider interface: Cloudflare and
+// Hetzner against testdata/fake-dns.py, PowerDNS against a real server.
+// test.sh starts both and sets the variables; a provider whose variable is
+// unset is skipped.
+//
+//     DEXDNS_FAKE        http://127.0.0.1:18898   (fake-dns.py)
+//     DEXDNS_PDNS        http://127.0.0.1:18081/api/v1/servers/localhost
+//     DEXDNS_PDNS_KEY    its X-API-Key
+import "fmt"
+import "os"
+import "github.com/ensamuel7/dex-modules/dexdns"
+
+fn rec(name: string, type: string, content: string, priority: int): dexdns.Record {
+    return dexdns.Record { name: name, type: type, content: content, ttl: 0, priority: priority, proxied: false }
+}
+
+fn count(l: dexdns.Listing): int {
+    assert(l.problem.isEmpty())
+    return l.records.len()
+}
+
+fn has(l: dexdns.Listing, r: dexdns.Record): bool {
+    return dexdns.holds(l.records, r)
+}
+
+// Everything a mail server and a deployer ask of a zone, on one provider.
+fn exercise(p: dexdns.Provider, domain: string): void {
+    let z: dexdns.Zone = p.zone(domain)
+
+    if (!z.problem.isEmpty()) {
+        fmt.println(p.kind() + ": " + z.problem)
+    }
+
+    assert(z.problem.isEmpty())
+    assert(!z.ref.isEmpty())
+    // Asking again finds the same zone.
+    let again: dexdns.Zone = p.zone(domain)
+    assert(again.ref == z.ref)
+
+    let www: string = "www." + domain
+    let none: dexdns.Record[] = []
+
+    // A records become exactly what is asked, both ways.
+    let two: dexdns.Record[] = [rec(www, "A", "203.0.113.5", 0), rec(www, "A", "203.0.113.6", 0)]
+    assert(p.replace(z, domain, www, "A", two).isEmpty())
+    assert(count(p.list(z, domain, www, "A")) == 2)
+    let one: dexdns.Record[] = [rec(www, "A", "203.0.113.6", 0)]
+    assert(p.replace(z, domain, www, "A", one).isEmpty())
+    let left: dexdns.Listing = p.list(z, domain, www, "A")
+    assert(count(left) == 1)
+    assert(has(left, one[0]))
+
+    // MX: priority survives the round trip.
+    let mx: dexdns.Record = rec(domain, "MX", "mail." + domain, 10)
+    assert(p.replace(z, domain, domain, "MX", [mx]).isEmpty())
+    let mxs: dexdns.Listing = p.list(z, domain, domain, "MX")
+    assert(count(mxs) == 1)
+    assert(mxs.records[0].priority == 10)
+    assert(mxs.records[0].content == "mail." + domain)
+
+    // TXT at the apex: a user's verification record is left alone while ours
+    // is added, changed and taken away.
+    let google: dexdns.Record = rec(domain, "TXT", "google-site-verification=abc123", 0)
+    let spf: dexdns.Record = rec(domain, "TXT", "v=spf1 mx -all", 0)
+    let spf2: dexdns.Record = rec(domain, "TXT", "v=spf1 mx a -all", 0)
+    assert(p.replace(z, domain, domain, "TXT", [google]).isEmpty())
+    assert(p.update(z, domain, domain, "TXT", [spf], none).isEmpty())
+    let txt: dexdns.Listing = p.list(z, domain, domain, "TXT")
+    assert(count(txt) == 2)
+    assert(has(txt, google) && has(txt, spf))
+    // Adding it again is a no-op.
+    assert(p.update(z, domain, domain, "TXT", [spf], none).isEmpty())
+    assert(count(p.list(z, domain, domain, "TXT")) == 2)
+    assert(p.update(z, domain, domain, "TXT", [spf2], [spf]).isEmpty())
+    txt = p.list(z, domain, domain, "TXT")
+    assert(count(txt) == 2)
+    assert(has(txt, google) && has(txt, spf2) && !has(txt, spf))
+    assert(p.update(z, domain, domain, "TXT", none, [spf2]).isEmpty())
+    txt = p.list(z, domain, domain, "TXT")
+    assert(count(txt) == 1)
+    assert(has(txt, google))
+
+    // A DKIM key longer than one TXT string comes back whole.
+    let key: string = "v=DKIM1; k=rsa; p="
+    while (key.len() < 410) {
+        key = key + "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+    }
+    let dkimName: string = "default._domainkey." + domain
+    let dkim: dexdns.Record = rec(dkimName, "TXT", key, 0)
+    assert(p.update(z, domain, dkimName, "TXT", [dkim], none).isEmpty())
+    let keys: dexdns.Listing = p.list(z, domain, dkimName, "TXT")
+    assert(count(keys) == 1)
+    assert(keys.records[0].content == key)
+
+    // SRV, for mail clients finding the server.
+    let srvName: string = "_imaps._tcp." + domain
+    let srv: dexdns.Record = rec(srvName, "SRV", "1 993 mail." + domain, 0)
+    assert(p.replace(z, domain, srvName, "SRV", [srv]).isEmpty())
+    let srvs: dexdns.Listing = p.list(z, domain, srvName, "SRV")
+    assert(count(srvs) == 1)
+    assert(has(srvs, srv))
+
+    // Every type at one name, and the whole zone.
+    assert(count(p.list(z, domain, domain, "")) >= 2)
+    let all: dexdns.Listing = p.list(z, domain, "", "")
+    assert(has(all, mx) && has(all, google) && has(all, dkim) && has(all, srv) && has(all, one[0]))
+
+    // Dropping the last value removes the RRset; replacing with none too.
+    assert(p.update(z, domain, dkimName, "TXT", none, [dkim]).isEmpty())
+    assert(count(p.list(z, domain, dkimName, "TXT")) == 0)
+    assert(p.replace(z, domain, www, "A", none).isEmpty())
+    assert(count(p.list(z, domain, www, "A")) == 0)
+    // Removing what is not there is fine.
+    assert(p.replace(z, domain, www, "A", none).isEmpty())
+
+    // Without a type, a write is refused rather than guessed at.
+    assert(!p.replace(z, domain, www, "", one).isEmpty())
+
+    assert(p.forget(z, domain).isEmpty())
+    fmt.println("  " + p.kind() + ": ok")
+}
+
+fn main(): void {
+    let fake: string = os.env("DEXDNS_FAKE")
+    let pdns: string = os.env("DEXDNS_PDNS")
+
+    if (fake.isEmpty()) {
+        fmt.println("  cloudflare, hetzner: skipped (DEXDNS_FAKE unset)")
+    } else {
+        let refused: dexdns.Cloudflare = dexdns.cloudflare(fake + "/client/v4", "nope")
+        assert(refused.zone("cf.example").problem.contains("Zone: DNS edit"))
+        let cf: dexdns.Cloudflare = dexdns.cloudflare(fake + "/client/v4", "cf-good")
+        cf.comment = "Kept by dexdns"
+        exercise(cf, "cf.example")
+
+        let wrong: dexdns.Hetzner = dexdns.hetzner(fake + "/v1", "nope")
+        assert(wrong.zone("hz.example").problem.contains("refused this token"))
+        let hz: dexdns.Hetzner = dexdns.hetzner(fake + "/v1", "hz-good")
+        exercise(hz, "hz.example")
+    }
+
+    if (pdns.isEmpty()) {
+        fmt.println("  powerdns: skipped (DEXDNS_PDNS unset)")
+    } else {
+        let unset: dexdns.PowerDns = dexdns.powerdns("", "", "", "The test nameserver")
+        assert(unset.zone("pdns.example").problem.contains("The test nameserver is not set up"))
+        let badKey: dexdns.PowerDns = dexdns.powerdns(pdns, "wrong", "ns1.pdns.example", "The test nameserver")
+        assert(badKey.zone("pdns.example").problem.startsWith("The test nameserver"))
+        let p: dexdns.PowerDns =
+            dexdns.powerdns(pdns, os.env("DEXDNS_PDNS_KEY"), "ns1.example.net ns2.example.net", "The test nameserver")
+        exercise(p, "pdns.example")
+        // forget dropped the zone at the server.
+        let check: dexdns.Listing = p.list(dexdns.Zone { ref: "pdns.example." }, "pdns.example", "", "")
+        assert(!check.problem.isEmpty())
+    }
+
+    fmt.println("providers_test: all assertions passed")
+}

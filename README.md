@@ -12,6 +12,7 @@ released without a new compiler.
 | `sqlite/` | `github.com/ensamuel7/dex-modules/sqlite` | libsqlite3 | `brew install sqlite` / `apt install libsqlite3-dev` |
 | `redis/` | `github.com/ensamuel7/dex-modules/redis` | hiredis | `brew install hiredis` / `apt install libhiredis-dev` |
 | `dexqu/` | `github.com/ensamuel7/dex-modules/dexqu` | nothing: a SQL query builder in pure Dex | |
+| `dexdns/` | `github.com/ensamuel7/dex-modules/dexdns` | nothing: DNS records at Cloudflare, Hetzner or PowerDNS, in pure Dex | |
 | `example/` | `github.com/ensamuel7/dex-modules/example` | uses both | |
 
 The two C wrappers find their library through `pkg-config`, so `pkg-config` has

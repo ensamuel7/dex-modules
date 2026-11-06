@@ -1,0 +1,1273 @@
+// Against a real broker: KAFKA_BROKERS, or localhost:9092. Every topic and group
+// here is named dexkafka.test.*, made here and removed here, so this is safe to
+// run against a broker that is in use.
+
+import "crypto"
+import "fmt"
+import "os"
+import "str"
+import "time"
+import "github.com/ensamuel7/dex-modules/kafka"
+
+const PREFIX: string = "dexkafka.test."
+const ALL_BYTES: string =
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+
+let brokers: string = "localhost:9092"
+let run: string = ""
+let serial: int = 0
+
+fn fresh(name: string): string {
+    serial = serial + 1
+    return PREFIX + run + "." + name + "." + str.fromInt(serial)
+}
+
+// Makes a topic and waits until it can be written, since creation is only
+// asynchronously visible to the other parts of a cluster.
+fn topic(a: kafka.Admin, name: string, partitions: int): string throws kafka.KafkaError {
+    let t: string = fresh(name)
+    a.createTopic(t, partitions, 1)
+    let tries: int = 0
+    while (tries < 100) {
+        let info: kafka.ClusterInfo = a.cluster(t)
+        if (info.topics.len() == 1 && info.topics[0].errorCode == 0 && info.topics[0].partitions.len() == partitions) {
+            return t
+        }
+
+        time.sleep(100)
+        tries = tries + 1
+    }
+
+    throw kafka.KafkaError("topic never appeared: " + t, 0, false, false, false)
+}
+
+// Polls until n messages arrive, or fails after waiting ms without one.
+fn take(c: kafka.Consumer, n: int, ms: int = 15000): kafka.Message[] throws kafka.KafkaError {
+    let out: kafka.Message[] = []
+    while (out.len() < n) {
+        let m: kafka.Message? = c.poll(ms)
+        if (m == null) {
+            fmt.println("timed out with ${out.len()} of ${n} messages")
+            assert(false)
+            return out
+        }
+
+        out.push(m)
+    }
+
+    return out
+}
+
+fn consumerOn(t: string, group: string): kafka.Consumer throws kafka.KafkaError {
+    let c: kafka.Consumer = kafka.consumer(brokers, group)
+    let topics: string[] = [t]
+    c.subscribe(topics)
+    return c
+}
+
+fn check(got: string, want: string): void {
+    if (got != want) {
+        fmt.println("want: " + want)
+        fmt.println("got:  " + got)
+        assert(false)
+    }
+}
+
+fn roundTrip(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "roundtrip", 3)
+    let p: kafka.Producer = kafka.producer(brokers)
+
+    let sent: kafka.Delivery = p.produceSync(
+        kafka.message(t, "hello")
+            .withKey("k1")
+            .withHeader("trace", "abc")
+            .withHeader("n", "1")
+            .withPartition(2)
+            .withTimestamp(1700000000123)
+    )
+    assert(sent.ok())
+    assert(sent.partition == 2)
+    assert(sent.offset == 0)
+    assert(sent.status == kafka.PERSISTED)
+    p.produce(t, "k2", "world")
+    assert(p.flush() == 0)
+    assert(p.delivered() == 2)
+    assert(p.failed() == 0)
+    assert(p.queued() == 0)
+
+    let c: kafka.Consumer = consumerOn(t, fresh("roundtrip"))
+    let got: kafka.Message[] = take(c, 2)
+    let first: kafka.Message = got[0]
+    if (first.key != "k1") {
+        first = got[1]
+    }
+
+    check(first.value, "hello")
+    check(first.key, "k1")
+    check(first.topic, t)
+    assert(first.partition == 2)
+    assert(first.offset == 0)
+    assert(first.timestamp == 1700000000123)
+    assert(first.hasKey)
+    assert(first.hasValue)
+    assert(first.headers.len() == 2)
+    check(first.headers[0].name, "trace")
+    check(first.header("n"), "1")
+    check(first.header("missing"), "")
+    c.close()
+    p.close()
+}
+
+// A payload is bytes, whatever they are: every byte value, NULs at either end,
+// and nothing but NULs, in the key, the value and a header.
+fn binary(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "binary", 1)
+    let p: kafka.Producer = kafka.producer(brokers)
+    let everyByte: string = crypto.base64Decode(ALL_BYTES)
+    assert(everyByte.len() == 256)
+    let nul: string = crypto.base64Decode("AA==")
+    assert(nul.len() == 1)
+
+    let sb = StringBuilder()
+    for (let i: int = 0; i < 70000; i++) {
+        sb.append(nul)
+    }
+
+    let zeros: string = sb.toString()
+    let edges: string = nul + "ab" + nul + nul + "cd" + nul
+    let values: string[] = [everyByte, nul, zeros, edges]
+    foreach (values as v) {
+        p.produceMessage(kafka.message(t, v).withKey(v).withHeader("h", v))
+    }
+
+    assert(p.flush() == 0)
+    let c: kafka.Consumer = consumerOn(t, fresh("binary"))
+    let got: kafka.Message[] = take(c, values.len())
+    for (let i: int = 0; i < values.len(); i++) {
+        let m: kafka.Message = got[i]
+        assert(m.value.len() == values[i].len())
+        assert(m.value == values[i])
+        assert(m.key == values[i])
+        assert(m.header("h") == values[i])
+    }
+
+    c.close()
+    p.close()
+}
+
+// NULL and empty are different things on the wire, and compaction relies on it.
+fn nullAndEmpty(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "null", 1)
+    let p: kafka.Producer = kafka.producer(brokers)
+    p.produceMessage(kafka.tombstone(t, "gone"))
+    p.produceMessage(kafka.message(t, ""))
+    p.produceMessage(kafka.message(t, "").withKey(""))
+    p.produce(t, "", "no key")
+    assert(p.flush() == 0)
+
+    let c: kafka.Consumer = consumerOn(t, fresh("null"))
+    let got: kafka.Message[] = take(c, 4)
+    let dead: kafka.Message = got[0]
+    assert(dead.hasKey)
+    assert(!dead.hasValue)
+    check(dead.key, "gone")
+    let blank: kafka.Message = got[1]
+    assert(!blank.hasKey)
+    assert(blank.hasValue)
+    assert(blank.value.len() == 0)
+    let blankKey: kafka.Message = got[2]
+    assert(blankKey.hasKey)
+    assert(blankKey.key.len() == 0)
+    let bare: kafka.Message = got[3]
+    assert(!bare.hasKey)
+    check(bare.value, "no key")
+    c.close()
+    p.close()
+}
+
+fn tracked(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "tracked", 2)
+    let p: kafka.Producer = kafka.producer(brokers)
+    let n: int = 2000
+    for (let i: int = 0; i < n; i++) {
+        p.produceTracked(kafka.message(t, "v" + str.fromInt(i)), 1000 + num64(i))
+    }
+
+    let seen: map[int, bool] = {}
+    let got: int = 0
+    while (got < n) {
+        let d: kafka.Delivery? = p.nextDelivery(15000)
+        assert(d != null)
+        if (d != null) {
+            assert(d.ok())
+            check(d.topic, t)
+            assert(d.status == kafka.PERSISTED)
+            assert(d.offset >= 0)
+            let index: int = toInt(d.tag) - 1000
+            assert(index >= 0 && index < n)
+            assert(!seen.has(index))
+            seen.set(index, true)
+        }
+
+        got = got + 1
+    }
+
+    let none: kafka.Delivery? = p.nextDelivery(0)
+    assert(none == null)
+    p.close()
+}
+
+fn num64(i: int): long {
+    let v: long = 0
+    for (let k: int = 0; k < i; k++) {
+        v = v + 1
+    }
+
+    return v
+}
+
+fn toInt(v: long): int {
+    return str.toInt(str.fromLong(v))
+}
+
+// A key always lands on one partition, in the order it was sent.
+fn keyOrder(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "order", 4)
+    let p: kafka.Producer = kafka.producer(brokers)
+    let keys: int = 20
+    let perKey: int = 500
+    for (let i: int = 0; i < perKey; i++) {
+        for (let k: int = 0; k < keys; k++) {
+            p.produce(t, "key" + str.fromInt(k), str.fromInt(i))
+        }
+    }
+
+    assert(p.flush() == 0)
+    let c: kafka.Consumer = consumerOn(t, fresh("order"))
+    let last: map[string, int] = {}
+    let partitionOf: map[string, int] = {}
+    let got: kafka.Message[] = take(c, keys * perKey)
+    foreach (got as m) {
+        let v: int = str.toInt(m.value)
+        if (last.has(m.key)) {
+            assert(v == last[m.key] + 1)
+            assert(partitionOf[m.key] == m.partition)
+        } else {
+            assert(v == 0)
+        }
+
+        last.set(m.key, v)
+        partitionOf.set(m.key, m.partition)
+    }
+
+    assert(last.len() == keys)
+    c.close()
+    p.close()
+}
+
+fn produceMany(p: kafka.Producer, t: string, w: int, each: int): int {
+    let bad: int = 0
+    for (let i: int = 0; i < each; i++) {
+        try {
+            let value: string = str.fromInt(w) + ":" + str.fromInt(i)
+            if (i % 100 == 0) {
+                let d: kafka.Delivery = p.produceSync(kafka.message(t, value))
+                if (!d.ok()) {
+                    bad = bad + 1
+                }
+            } else {
+                p.produce(t, "", value)
+            }
+        } catch (e: kafka.KafkaError) {
+            bad = bad + 1
+        }
+    }
+
+    return bad
+}
+
+// One producer shared by threads, every message arriving exactly once.
+fn sharedProducer(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "shared", 3)
+    let p: kafka.Producer = kafka.producer(brokers)
+    let threads: int = 6
+    let each: int = 1000
+    let done = channel(int)
+    for (let w: int = 0; w < threads; w++) {
+        spawn {
+            send(done, produceMany(p, t, w, each))
+        }
+    }
+
+    for (let w: int = 0; w < threads; w++) {
+        assert(receive(done) == 0)
+    }
+
+    assert(p.flush() == 0)
+    assert(p.delivered() == threads * each)
+
+    let c: kafka.Consumer = consumerOn(t, fresh("shared"))
+    let seen: map[string, int] = {}
+    let got: kafka.Message[] = take(c, threads * each)
+    foreach (got as m) {
+        assert(!seen.has(m.value))
+        seen.set(m.value, 1)
+    }
+
+    assert(seen.len() == threads * each)
+    let extra: kafka.Message? = c.poll(500)
+    assert(extra == null)
+    c.close()
+    p.close()
+}
+
+// What was committed is not read again; what was not, is.
+fn commitAndResume(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "commit", 1)
+    let p: kafka.Producer = kafka.producer(brokers)
+    for (let i: int = 0; i < 10; i++) {
+        p.produce(t, "", str.fromInt(i))
+    }
+
+    assert(p.flush() == 0)
+    let group: string = fresh("commit")
+
+    let c1: kafka.Consumer = consumerOn(t, group)
+    let firstFour: kafka.Message[] = take(c1, 4)
+    c1.commitMessage(firstFour[3])
+    let notCommitted: kafka.Message[] = take(c1, 2)
+    check(notCommitted[1].value, "5")
+    let here: kafka.TopicPartition[] = [kafka.partitionAt(t, 0, kafka.OFFSET_INVALID)]
+    assert(c1.position(here)[0].offset == 6)
+    assert(c1.committed(here)[0].offset == 4)
+    c1.close()
+
+    let c2: kafka.Consumer = consumerOn(t, group)
+    let rest: kafka.Message[] = take(c2, 6)
+    check(rest[0].value, "4")
+    check(rest[5].value, "9")
+    c2.commit()
+    c2.close()
+
+    let c3: kafka.Consumer = consumerOn(t, group)
+    let nothing: kafka.Message? = c3.poll(1500)
+    assert(nothing == null)
+    assert(c3.committed(here)[0].offset == 10)
+    c3.commitAsync()
+    c3.close()
+    p.close()
+}
+
+// Offsets stored by hand, committed by the timer: nothing unhandled is committed.
+fn storedOffsets(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "store", 1)
+    let p: kafka.Producer = kafka.producer(brokers)
+    for (let i: int = 0; i < 5; i++) {
+        p.produce(t, "", str.fromInt(i))
+    }
+
+    assert(p.flush() == 0)
+    let group: string = fresh("store")
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("group.id", group)
+    config.set("enable.auto.commit", "true")
+    config.set("auto.commit.interval.ms", "100")
+    config.set("enable.auto.offset.store", "false")
+    let c: kafka.Consumer = kafka.consumerWith(config)
+    let topics: string[] = [t]
+    c.subscribe(topics)
+    let got: kafka.Message[] = take(c, 5)
+    c.store(got[2])
+    let idle: kafka.Message? = c.poll(500)
+    assert(idle == null)
+    let here: kafka.TopicPartition[] = [kafka.partitionAt(t, 0, kafka.OFFSET_INVALID)]
+    assert(c.committed(here)[0].offset == 3)
+    c.close()
+    p.close()
+}
+
+// Whether a rebalance has settled, with both members holding part of the four.
+fn shared(c1: kafka.Consumer, c2: kafka.Consumer): bool throws kafka.KafkaError {
+    let one: int = c1.assignment().len()
+    let two: int = c2.assignment().len()
+    return one > 0 && two > 0 && one + two == 4
+}
+
+fn commitTolerating(c: kafka.Consumer, m: kafka.Message): void throws kafka.KafkaError {
+    try {
+        c.commitMessage(m)
+    } catch (e: kafka.KafkaError) {
+        if (!kafka.isRebalance(e.code)) {
+            throw kafka.KafkaError(e.message, e.code, e.fatal, e.retriable, e.abortable)
+        }
+    }
+}
+
+fn runGroup(a: kafka.Admin, assignor: string): void throws kafka.KafkaError {
+    let t: string = topic(a, "group", 4)
+    let group: string = fresh("group")
+    let p: kafka.Producer = kafka.producer(brokers)
+    let total: int = 2000
+    for (let i: int = 0; i < total; i++) {
+        p.produce(t, str.fromInt(i), str.fromInt(i))
+    }
+
+    assert(p.flush() == 0)
+
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("group.id", group)
+    config.set("partition.assignment.strategy", assignor)
+    config.set("session.timeout.ms", "6000")
+    config.set("heartbeat.interval.ms", "500")
+    let topics: string[] = [t]
+
+    let c1: kafka.Consumer = kafka.consumerWith(config)
+    c1.subscribe(topics)
+    let seen: map[string, int] = {}
+    let early: kafka.Message[] = take(c1, 100)
+    foreach (early as m) {
+        seen.set(m.value, 1)
+    }
+
+    c1.commit()
+    let assigned: kafka.Rebalance[] = c1.rebalances()
+    assert(assigned.len() >= 1)
+    assert(assigned[0].kind == kafka.REBALANCE_ASSIGNED)
+    assert(c1.assignment().len() == 4)
+    assert(!c1.memberId().isEmpty())
+
+    // A second member joins: partitions are shared out while both keep polling.
+    let c2: kafka.Consumer = kafka.consumerWith(config)
+    c2.subscribe(topics)
+    let tries: int = 0
+    while (tries < 400 && !shared(c1, c2)) {
+        let m1: kafka.Message? = c1.poll(50)
+        if (m1 != null) {
+            seen.set(m1.value, 1)
+            commitTolerating(c1, m1)
+        }
+
+        let m2: kafka.Message? = c2.poll(50)
+        if (m2 != null) {
+            seen.set(m2.value, 1)
+            commitTolerating(c2, m2)
+        }
+
+        tries = tries + 1
+    }
+
+    assert(shared(c1, c2))
+
+    // The first leaves. Everything still unread must reach the second.
+    c1.close()
+    let quiet: int = 0
+    while (quiet < 30) {
+        let m: kafka.Message? = c2.poll(500)
+        if (m == null) {
+            quiet = quiet + 1
+        } else {
+            seen.set(m.value, 1)
+            quiet = 0
+        }
+
+        if (seen.len() == total) {
+            break
+        }
+    }
+
+    assert(seen.len() == total)
+    assert(c2.assignment().len() == 4)
+    c2.close()
+    p.close()
+    a.deleteGroup(group)
+}
+
+fn seekAndFriends(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "seek", 1)
+    let p: kafka.Producer = kafka.producer(brokers)
+    for (let i: int = 0; i < 10; i++) {
+        p.produceMessage(kafka.message(t, str.fromInt(i)).withTimestamp(1700000000000 + num64(i * 1000)))
+    }
+
+    assert(p.flush() == 0)
+
+    let c: kafka.Consumer = kafka.consumer(brokers, fresh("seek"))
+    let marks: kafka.Watermarks = c.watermarks(t, 0)
+    assert(marks.low == 0)
+    assert(marks.high == 10)
+
+    let only: kafka.TopicPartition[] = [kafka.partitionAt(t, 0, 7)]
+    c.assign(only)
+    assert(c.assignment().len() == 1)
+    let at7: kafka.Message[] = take(c, 1)
+    check(at7[0].value, "7")
+
+    c.seek(t, 0, 2)
+    let at2: kafka.Message[] = take(c, 1)
+    check(at2[0].value, "2")
+
+    let byTime: kafka.TopicPartition[] = [kafka.partitionAt(t, 0, 1700000005000)]
+    assert(c.offsetsForTimes(byTime)[0].offset == 5)
+    let future: kafka.TopicPartition[] = [kafka.partitionAt(t, 0, 1900000000000)]
+    assert(c.offsetsForTimes(future)[0].offset == kafka.OFFSET_END)
+
+    // Paused partitions deliver nothing until resumed, while the consumer lives.
+    c.pause(only)
+    let paused: kafka.Message? = c.poll(800)
+    assert(paused == null)
+    c.resume(only)
+    let resumed: kafka.Message[] = take(c, 1)
+    check(resumed[0].value, "3")
+
+    c.unassign()
+    assert(c.assignment().len() == 0)
+    c.close()
+    p.close()
+}
+
+fn endOfPartition(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "eof", 1)
+    let p: kafka.Producer = kafka.producer(brokers)
+    p.produce(t, "", "only")
+    assert(p.flush() == 0)
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("group.id", fresh("eof"))
+    config.set("enable.partition.eof", "true")
+    let c: kafka.Consumer = kafka.consumerWith(config)
+    let topics: string[] = [t]
+    c.subscribe(topics)
+    let got: kafka.Message[] = take(c, 2)
+    assert(!got[0].eof)
+    check(got[0].value, "only")
+    assert(got[1].eof)
+    assert(got[1].offset == 1)
+    c.close()
+    p.close()
+}
+
+fn pollBatches(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "batch", 1)
+    let p: kafka.Producer = kafka.producer(brokers)
+    for (let i: int = 0; i < 250; i++) {
+        p.produce(t, "", str.fromInt(i))
+    }
+
+    assert(p.flush() == 0)
+    let c: kafka.Consumer = consumerOn(t, fresh("batch"))
+    let all: int = 0
+    let tries: int = 0
+    while (all < 250 && tries < 200) {
+        let b: kafka.Message[] = c.pollBatch(100, 200)
+        assert(b.len() <= 100)
+        foreach (b as m) {
+            assert(str.toInt(m.value) == all)
+            all = all + 1
+        }
+
+        tries = tries + 1
+    }
+
+    assert(all == 250)
+    c.close()
+    p.close()
+}
+
+fn txnProducer(id: string): kafka.Producer throws kafka.KafkaError {
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("transactional.id", id)
+    let p: kafka.Producer = kafka.producerWith(config)
+    p.initTransactions()
+    return p
+}
+
+fn committedReader(t: string, group: string): kafka.Consumer throws kafka.KafkaError {
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("group.id", group)
+    config.set("isolation.level", "read_committed")
+    let c: kafka.Consumer = kafka.consumerWith(config)
+    let topics: string[] = [t]
+    c.subscribe(topics)
+    return c
+}
+
+fn transactions(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "txn", 1)
+    let p: kafka.Producer = txnProducer(fresh("txn"))
+
+    p.beginTransaction()
+    p.produce(t, "", "kept")
+    p.commitTransaction()
+
+    p.beginTransaction()
+    p.produce(t, "", "dropped")
+    assert(p.flush() == 0)
+    p.abortTransaction()
+
+    p.beginTransaction()
+    p.produce(t, "", "also kept")
+    p.commitTransaction()
+
+    let c: kafka.Consumer = committedReader(t, fresh("txn"))
+    let got: kafka.Message[] = take(c, 2)
+    check(got[0].value, "kept")
+    check(got[1].value, "also kept")
+    let extra: kafka.Message? = c.poll(800)
+    assert(extra == null)
+    c.close()
+    p.close()
+}
+
+// Consume, transform, produce: the input is marked read exactly when the output
+// appears, so a crash either way neither loses nor doubles anything.
+fn exactlyOnce(a: kafka.Admin): void throws kafka.KafkaError {
+    let input: string = topic(a, "eos.in", 1)
+    let output: string = topic(a, "eos.out", 1)
+    let group: string = fresh("eos")
+    let src: kafka.Producer = kafka.producer(brokers)
+    for (let i: int = 0; i < 5; i++) {
+        src.produce(input, "", str.fromInt(i))
+    }
+
+    assert(src.flush() == 0)
+    src.close()
+
+    let p: kafka.Producer = txnProducer(fresh("eos"))
+    let c: kafka.Consumer = committedReader(input, group)
+
+    // An aborted attempt: output hidden, and the input offsets not moved.
+    let attempt: kafka.Message[] = take(c, 5)
+    p.beginTransaction()
+    foreach (attempt as m) {
+        p.produce(output, "", "x" + m.value)
+    }
+
+    p.sendOffsets(c)
+    p.abortTransaction()
+    let here: kafka.TopicPartition[] = [kafka.partitionAt(input, 0, kafka.OFFSET_INVALID)]
+    assert(c.committed(here)[0].offset == kafka.OFFSET_INVALID)
+    c.seek(input, 0, 0)
+
+    let retry: kafka.Message[] = take(c, 5)
+    p.beginTransaction()
+    foreach (retry as m) {
+        p.produce(output, "", "y" + m.value)
+    }
+
+    p.sendOffsets(c)
+    p.commitTransaction()
+    assert(c.committed(here)[0].offset == 5)
+    c.close()
+
+    let r: kafka.Consumer = committedReader(output, fresh("eos.read"))
+    let out: kafka.Message[] = take(r, 5)
+    check(out[0].value, "y0")
+    check(out[4].value, "y4")
+    let extra: kafka.Message? = r.poll(800)
+    assert(extra == null)
+    r.close()
+    p.close()
+}
+
+// A second producer with the same id takes over; the first must find out.
+fn fencing(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "fence", 1)
+    let id: string = fresh("fence")
+    let zombie: kafka.Producer = txnProducer(id)
+    zombie.beginTransaction()
+    zombie.produce(t, "", "zombie")
+    assert(zombie.flush() == 0)
+
+    let live: kafka.Producer = txnProducer(id)
+    live.beginTransaction()
+    live.produce(t, "", "live")
+    live.commitTransaction()
+
+    let caught: bool = false
+    let fatal: bool = false
+    try {
+        zombie.commitTransaction(10000)
+    } catch (e: kafka.KafkaError) {
+        caught = true
+        fatal = e.fatal
+    }
+
+    assert(caught)
+    assert(fatal)
+    zombie.close(0)
+    live.close()
+}
+
+fn administration(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "admin", 2)
+    let dup: int = 0
+    try {
+        a.createTopic(t, 1, 1)
+    } catch (e: kafka.KafkaError) {
+        dup = e.code
+    }
+
+    assert(dup == kafka.ERR_TOPIC_ALREADY_EXISTS)
+    check(kafka.errorName(dup), "TOPIC_ALREADY_EXISTS")
+
+    a.createPartitions(t, 5)
+    let tries: int = 0
+    while (a.cluster(t).topics[0].partitions.len() != 5 && tries < 50) {
+        time.sleep(100)
+        tries = tries + 1
+    }
+
+    let info: kafka.ClusterInfo = a.cluster(t)
+    assert(info.brokers.len() >= 1)
+    assert(info.brokers[0].port > 0)
+    assert(!info.brokers[0].host.isEmpty())
+    assert(info.topics[0].partitions.len() == 5)
+    assert(info.topics[0].partitions[0].leader >= 0)
+    assert(info.topics[0].partitions[0].replicas == 1)
+    assert(info.topics[0].partitions[0].inSync == 1)
+
+    let everything: kafka.ClusterInfo = a.cluster()
+    let found: bool = false
+    foreach (everything.topics as candidate) {
+        if (candidate.name == t) {
+            found = true
+        }
+    }
+
+    assert(found)
+
+    let settings: map[string, string] = {}
+    settings.set("cleanup.policy", "compact")
+    let compacted: string = fresh("compact")
+    a.createTopicWith(compacted, 1, 1, settings)
+
+    let bad: int = 0
+    let badSettings: map[string, string] = {}
+    badSettings.set("no.such.setting", "1")
+    try {
+        a.createTopicWith(fresh("bad"), 1, 1, badSettings)
+    } catch (e: kafka.KafkaError) {
+        bad = e.code
+    }
+
+    assert(bad != 0)
+
+    let group: string = fresh("admin")
+    let c: kafka.Consumer = consumerOn(t, group)
+    let quiet: kafka.Message? = c.poll(3000)
+    assert(quiet == null)
+    let live: kafka.GroupInfo[] = a.groups(group)
+    assert(live.len() == 1)
+    check(live[0].name, group)
+    assert(live[0].members == 1)
+    c.close()
+
+    let tries2: int = 0
+    let deleted: bool = false
+    while (!deleted && tries2 < 20) {
+        try {
+            a.deleteGroup(group)
+            deleted = true
+        } catch (e: kafka.KafkaError) {
+            time.sleep(500)
+        }
+
+        tries2 = tries2 + 1
+    }
+
+    assert(deleted)
+
+    let missing: int = 0
+    try {
+        a.deleteGroup(group)
+    } catch (e: kafka.KafkaError) {
+        missing = e.code
+    }
+
+    assert(missing == kafka.ERR_GROUP_ID_NOT_FOUND)
+    a.deleteTopic(compacted)
+}
+
+fn misuse(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "misuse", 1)
+
+    let badConfig: string = ""
+    try {
+        let config: map[string, string] = {}
+        config.set("no.such.setting", "1")
+        kafka.producerWith(config)
+    } catch (e: kafka.KafkaError) {
+        badConfig = e.message
+    }
+
+    assert(badConfig.contains("no.such.setting"))
+
+    let noGroup: bool = false
+    try {
+        let config: map[string, string] = {}
+        config.set("bootstrap.servers", brokers)
+        kafka.consumerWith(config)
+    } catch (e: kafka.KafkaError) {
+        noGroup = e.message.contains("group.id")
+    }
+
+    assert(noGroup)
+
+    // Too big for the client's limit: refused at once, and nothing is queued.
+    let p: kafka.Producer = kafka.producer(brokers)
+    let sb = StringBuilder()
+    for (let i: int = 0; i < 1100000; i++) {
+        sb.append('x')
+    }
+
+    let tooBig: int = 0
+    try {
+        p.produce(t, "", sb.toString())
+    } catch (e: kafka.KafkaError) {
+        tooBig = e.code
+    }
+
+    assert(tooBig == kafka.ERR_MSG_SIZE_TOO_LARGE)
+
+    let noPartition: int = 0
+    try {
+        p.produceSync(kafka.message(t, "x").withPartition(99))
+    } catch (e: kafka.KafkaError) {
+        noPartition = e.code
+    }
+
+    assert(noPartition == kafka.ERR_UNKNOWN_PARTITION)
+
+    // A close is final and can be repeated; afterwards calls say so.
+    assert(p.close() == 0)
+    assert(p.close() == 0)
+    let afterClose: int = 0
+    try {
+        p.produce(t, "", "late")
+    } catch (e: kafka.KafkaError) {
+        afterClose = e.code
+    }
+
+    assert(afterClose == kafka.ERR_STATE)
+
+    let c: kafka.Consumer = consumerOn(t, fresh("misuse"))
+    c.close()
+    c.close()
+    let pollClosed: int = 0
+    try {
+        c.poll(10)
+    } catch (e: kafka.KafkaError) {
+        pollClosed = e.code
+    }
+
+    assert(pollClosed == kafka.ERR_STATE)
+
+    // A topic that does not exist is reported, and the consumer carries on.
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("group.id", fresh("missing"))
+    config.set("allow.auto.create.topics", "false")
+    let lost: kafka.Consumer = kafka.consumerWith(config)
+    let topics: string[] = [fresh("does.not.exist")]
+    lost.subscribe(topics)
+    let code: int = 0
+    let tries: int = 0
+    while (code == 0 && tries < 40) {
+        try {
+            lost.poll(250)
+        } catch (e: kafka.KafkaError) {
+            code = e.code
+        }
+
+        tries = tries + 1
+    }
+
+    assert(code == kafka.ERR_UNKNOWN_TOPIC_OR_PART)
+    let carryOn: kafka.Message? = lost.poll(10)
+    assert(carryOn == null)
+    lost.close()
+}
+
+fn syncCode(p: kafka.Producer): int {
+    try {
+        p.produceSync(kafka.message("t", "x"))
+    } catch (e: kafka.KafkaError) {
+        return e.code
+    }
+
+    return 0
+}
+
+// Nothing listening. Nothing here may hang or be lost without a word.
+fn noBroker(): void throws kafka.KafkaError {
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", "localhost:1")
+    config.set("message.timeout.ms", "500")
+    config.set("log_level", "0")
+    let p: kafka.Producer = kafka.producerWith(config)
+
+    let code: int = 0
+    let possibly: bool = false
+    try {
+        p.produceSync(kafka.message("t", "x"))
+    } catch (e: kafka.KafkaError) {
+        code = e.code
+        possibly = e.retriable
+    }
+
+    assert(code == kafka.ERR_MSG_TIMED_OUT)
+    assert(possibly)
+    assert(p.failed() == 1)
+
+    p.produce("t", "", "fire and forget")
+    assert(p.flush(5000) == 0)
+    assert(p.failed() == 2)
+    assert(p.delivered() == 0)
+
+    p.produceTracked(kafka.message("t", "tracked"), 42)
+    let d: kafka.Delivery? = p.nextDelivery(5000)
+    assert(d != null)
+    if (d != null) {
+        assert(!d.ok())
+        assert(d.tag == 42)
+        assert(d.errorCode == kafka.ERR_MSG_TIMED_OUT)
+        assert(d.status == kafka.NOT_PERSISTED)
+    }
+
+    let sawUndelivered: bool = false
+    let sawBroker: bool = false
+    foreach (p.errors() as e) {
+        if (e.message.contains("delivery to t failed")) {
+            sawUndelivered = true
+        } else {
+            sawBroker = true
+        }
+    }
+
+    assert(sawUndelivered)
+    assert(sawBroker)
+    assert(p.errors().len() == 0)
+    p.close()
+
+    // A full queue: tryProduce says so, and closing fails what is left.
+    let small: map[string, string] = {}
+    small.set("bootstrap.servers", "localhost:1")
+    small.set("queue.buffering.max.messages", "2")
+    small.set("log_level", "0")
+    let tight: kafka.Producer = kafka.producerWith(small)
+    assert(tight.tryProduce(kafka.message("t", "1")))
+    assert(tight.tryProduce(kafka.message("t", "2")))
+    assert(!tight.tryProduce(kafka.message("t", "3")))
+    assert(tight.queued() == 2)
+    assert(tight.close(100) == 2)
+    assert(tight.failed() == 2)
+
+    // A thread stuck waiting for a delivery is released by close.
+    let stuck: map[string, string] = {}
+    stuck.set("bootstrap.servers", "localhost:1")
+    stuck.set("log_level", "0")
+    let waiting: kafka.Producer = kafka.producerWith(stuck)
+    let released = channel(int)
+    spawn {
+        send(released, syncCode(waiting))
+    }
+
+    time.sleep(300)
+    waiting.close(100)
+    assert(receive(released) != 0)
+
+    // The admin's calls time out rather than hang.
+    let adminConfig: map[string, string] = {}
+    adminConfig.set("bootstrap.servers", "localhost:1")
+    adminConfig.set("log_level", "0")
+    let lonely: kafka.Admin = kafka.adminWith(adminConfig)
+    let timedOut: int = 0
+    try {
+        lonely.cluster("", 300)
+    } catch (e: kafka.KafkaError) {
+        timedOut = e.code
+    }
+
+    assert(timedOut != 0)
+
+    // wake makes a long poll return now, from another thread.
+    let cc: map[string, string] = {}
+    cc.set("bootstrap.servers", "localhost:1")
+    cc.set("group.id", "dexkafka.test.nobroker")
+    cc.set("log_level", "0")
+    let sleeper: kafka.Consumer = kafka.consumerWith(cc)
+    let topics: string[] = ["t"]
+    sleeper.subscribe(topics)
+    let started: long = time.now()
+    spawn {
+        time.sleep(200)
+        sleeper.wake()
+    }
+
+    let woken: kafka.Message? = sleeper.poll(20000)
+    assert(woken == null)
+    assert(time.now() - started < 5000)
+    sleeper.close()
+}
+
+fn produceOne(p: kafka.Producer, t: string): int {
+    let alias: kafka.Producer = p
+    try {
+        alias.produce(t, "", "20")
+    } catch (e: kafka.KafkaError) {
+        return 1
+    }
+
+    return 0
+}
+
+// Clients are made, used and dropped without being closed by hand: flushed on
+// the way out, from whichever thread lets go last, with nothing left behind.
+fn lifetimes(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "life", 1)
+    for (let i: int = 0; i < 20; i++) {
+        let p: kafka.Producer = kafka.producer(brokers)
+        p.produce(t, "", str.fromInt(i))
+    }
+
+    let copies: kafka.Producer = kafka.producer(brokers)
+    let done = channel(int)
+    spawn {
+        send(done, produceOne(copies, t))
+    }
+
+    assert(receive(done) == 0)
+    assert(copies.flush() == 0)
+
+    let c: kafka.Consumer = consumerOn(t, fresh("life"))
+    let got: kafka.Message[] = take(c, 21)
+    assert(got.len() == 21)
+    c.close()
+
+    // Messages kept past the client that read them stay readable.
+    let kept: kafka.Message[] = keepAfterClose(t)
+    assert(kept.len() == 21)
+    assert(!kept[20].value.isEmpty())
+}
+
+fn keepAfterClose(t: string): kafka.Message[] throws kafka.KafkaError {
+    let c: kafka.Consumer = consumerOn(t, fresh("keep"))
+    return take(c, 21)
+}
+
+// A failed call unwinding out of the frame holding the client must not keep the
+// client alive, or it never closes.
+fn throwsThrough(t: string): void throws kafka.KafkaError {
+    let p: kafka.Producer = kafka.producer(brokers)
+    p.produceSync(kafka.message(t, "x").withPartition(99))
+}
+
+fn unwinding(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "unwind", 1)
+    for (let i: int = 0; i < 10; i++) {
+        let code: int = 0
+        try {
+            throwsThrough(t)
+        } catch (e: kafka.KafkaError) {
+            code = e.code
+        }
+
+        assert(code == kafka.ERR_UNKNOWN_PARTITION)
+    }
+}
+
+fn statistics(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "stats", 1)
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("statistics.interval.ms", "100")
+    let p: kafka.Producer = kafka.producerWith(config)
+    assert(p.stats().len() == 0 || p.stats().startsWith("{"))
+    p.produce(t, "", "x")
+    assert(p.flush() == 0)
+    time.sleep(400)
+    assert(p.stats().startsWith("{"))
+    assert(p.stats().contains("\"name\""))
+    p.close()
+}
+
+// The constants are written out in kafka.dx, so hold them to librdkafka's names.
+fn errorConstants(): void {
+    check(kafka.errorName(kafka.ERR_NONE), "NO_ERROR")
+    check(kafka.errorName(kafka.ERR_QUEUE_FULL), "_QUEUE_FULL")
+    check(kafka.errorName(kafka.ERR_TIMED_OUT), "_TIMED_OUT")
+    check(kafka.errorName(kafka.ERR_STATE), "_STATE")
+    check(kafka.errorName(kafka.ERR_MSG_TIMED_OUT), "_MSG_TIMED_OUT")
+    check(kafka.errorName(kafka.ERR_PARTITION_EOF), "_PARTITION_EOF")
+    check(kafka.errorName(kafka.ERR_TRANSPORT), "_TRANSPORT")
+    check(kafka.errorName(kafka.ERR_ALL_BROKERS_DOWN), "_ALL_BROKERS_DOWN")
+    check(kafka.errorName(kafka.ERR_INVALID_ARG), "_INVALID_ARG")
+    check(kafka.errorName(kafka.ERR_UNKNOWN_TOPIC), "_UNKNOWN_TOPIC")
+    check(kafka.errorName(kafka.ERR_UNKNOWN_PARTITION), "_UNKNOWN_PARTITION")
+    check(kafka.errorName(kafka.ERR_MAX_POLL_EXCEEDED), "_MAX_POLL_EXCEEDED")
+    check(kafka.errorName(kafka.ERR_FATAL), "_FATAL")
+    check(kafka.errorName(kafka.ERR_MSG_SIZE_TOO_LARGE), "MSG_SIZE_TOO_LARGE")
+    check(kafka.errorName(kafka.ERR_UNKNOWN_TOPIC_OR_PART), "UNKNOWN_TOPIC_OR_PART")
+    check(kafka.errorName(kafka.ERR_TOPIC_ALREADY_EXISTS), "TOPIC_ALREADY_EXISTS")
+    check(kafka.errorName(kafka.ERR_GROUP_ID_NOT_FOUND), "GROUP_ID_NOT_FOUND")
+    check(kafka.errorName(kafka.ERR_ILLEGAL_GENERATION), "ILLEGAL_GENERATION")
+    check(kafka.errorName(kafka.ERR_UNKNOWN_MEMBER_ID), "UNKNOWN_MEMBER_ID")
+    check(kafka.errorName(kafka.ERR_REBALANCE_IN_PROGRESS), "REBALANCE_IN_PROGRESS")
+    assert(kafka.isRebalance(kafka.ERR_ILLEGAL_GENERATION))
+    assert(!kafka.isRebalance(kafka.ERR_TIMED_OUT))
+    assert(!kafka.errorText(kafka.ERR_TIMED_OUT).isEmpty())
+}
+
+// Too long between polls: the next poll says so, and the one after rejoins the
+// group and reads on from the last commit.
+fn slowConsumer(a: kafka.Admin): void throws kafka.KafkaError {
+    let t: string = topic(a, "slow", 1)
+    let p: kafka.Producer = kafka.producer(brokers)
+    p.produce(t, "", "first")
+    p.produce(t, "", "second")
+    assert(p.flush() == 0)
+    p.close()
+
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("group.id", fresh("slow"))
+    config.set("session.timeout.ms", "6000")
+    config.set("max.poll.interval.ms", "6000")
+    config.set("heartbeat.interval.ms", "1000")
+    let c: kafka.Consumer = kafka.consumerWith(config)
+    let topics: string[] = [t]
+    c.subscribe(topics)
+    let got: kafka.Message[] = take(c, 1)
+    c.commitMessage(got[0])
+    time.sleep(8000)
+
+    let code: int = 0
+    try {
+        c.poll(1000)
+    } catch (e: kafka.KafkaError) {
+        code = e.code
+    }
+
+    assert(code == kafka.ERR_MAX_POLL_EXCEEDED)
+    let after: kafka.Message[] = take(c, 1)
+    check(after[0].value, "second")
+    c.close()
+}
+
+// Removes every topic and group of this prefix, this run's and any a crashed run left.
+fn sweep(a: kafka.Admin): void throws kafka.KafkaError {
+    foreach (a.cluster().topics as t) {
+        if (t.name.startsWith(PREFIX)) {
+            a.deleteTopic(t.name)
+        }
+    }
+
+    foreach (a.groups() as g) {
+        if (g.name.startsWith(PREFIX) && g.members == 0) {
+            try {
+                a.deleteGroup(g.name)
+            } catch (e: kafka.KafkaError) {
+                fmt.println("left group " + g.name + ": " + e.message)
+            }
+        }
+    }
+}
+
+fn runAll(): void throws kafka.KafkaError {
+    let a: kafka.Admin = kafka.admin(brokers)
+    sweep(a)
+    let steps: string[] = []
+    roundTrip(a)
+    steps.push("roundTrip")
+    fmt.println("  ok: roundTrip")
+    binary(a)
+    steps.push("binary")
+    fmt.println("  ok: binary")
+    nullAndEmpty(a)
+    steps.push("nullAndEmpty")
+    fmt.println("  ok: nullAndEmpty")
+    tracked(a)
+    steps.push("tracked")
+    fmt.println("  ok: tracked")
+    keyOrder(a)
+    steps.push("keyOrder")
+    fmt.println("  ok: keyOrder")
+    sharedProducer(a)
+    steps.push("sharedProducer")
+    fmt.println("  ok: sharedProducer")
+    commitAndResume(a)
+    steps.push("commitAndResume")
+    fmt.println("  ok: commitAndResume")
+    storedOffsets(a)
+    steps.push("storedOffsets")
+    fmt.println("  ok: storedOffsets")
+    runGroup(a, "range")
+    steps.push("group range")
+    fmt.println("  ok: group range")
+    runGroup(a, "cooperative-sticky")
+    steps.push("group cooperative")
+    fmt.println("  ok: group cooperative")
+    seekAndFriends(a)
+    steps.push("seek")
+    fmt.println("  ok: seek")
+    endOfPartition(a)
+    steps.push("eof")
+    fmt.println("  ok: eof")
+    pollBatches(a)
+    steps.push("batches")
+    fmt.println("  ok: batches")
+    transactions(a)
+    steps.push("transactions")
+    fmt.println("  ok: transactions")
+    exactlyOnce(a)
+    steps.push("exactlyOnce")
+    fmt.println("  ok: exactlyOnce")
+    fencing(a)
+    steps.push("fencing")
+    fmt.println("  ok: fencing")
+    administration(a)
+    steps.push("administration")
+    fmt.println("  ok: administration")
+    misuse(a)
+    steps.push("misuse")
+    fmt.println("  ok: misuse")
+    noBroker()
+    steps.push("noBroker")
+    fmt.println("  ok: noBroker")
+    lifetimes(a)
+    steps.push("lifetimes")
+    fmt.println("  ok: lifetimes")
+    unwinding(a)
+    steps.push("unwinding")
+    fmt.println("  ok: unwinding")
+    statistics(a)
+    steps.push("statistics")
+    fmt.println("  ok: statistics")
+    errorConstants()
+    steps.push("errorConstants")
+    fmt.println("  ok: errorConstants")
+    slowConsumer(a)
+    steps.push("slowConsumer")
+    fmt.println("  ok: slowConsumer")
+    sweep(a)
+    fmt.println("kafka_test: ${steps.len()} groups of assertions passed on librdkafka " + kafka.libVersion())
+}
+
+fn main(): void {
+    let fromEnv: string = os.env("KAFKA_BROKERS")
+    if (!fromEnv.isEmpty()) {
+        brokers = fromEnv
+    }
+
+    run = str.fromLong(time.nowNs())
+    try {
+        runAll()
+    } catch (e: kafka.KafkaError) {
+        fmt.println("kafka_test failed: " + e.message + " (" + kafka.errorName(e.code) + ")")
+        assert(false)
+    }
+}

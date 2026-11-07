@@ -1,0 +1,83 @@
+// The two halves of chaos.sh. See there.
+
+import "fmt"
+import "os"
+import "str"
+import "time"
+import "github.com/ensamuel7/dex-modules/kafka"
+
+const KEYS: int = 50
+
+fn producing(brokers: string, topic: string, count: int): void throws kafka.KafkaError {
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("message.timeout.ms", "300000")
+    config.set("log_level", "2")
+    let p: kafka.Producer = kafka.producerWith(config)
+    for (let i: int = 0; i < count; i++) {
+        let key: string = "key" + str.fromInt(i % KEYS)
+        p.produce(topic, key, str.fromInt(i / KEYS))
+        if (i % 3 == 0) {
+            time.sleep(1)
+        }
+
+        if (i % 10000 == 0) {
+            fmt.println("produced ${i}, queued ${p.queued()}, delivered ${p.delivered()}, failed ${p.failed()}")
+        }
+    }
+
+    let left: int = p.flush(300000)
+    fmt.println("RESULT produced=${count} delivered=${p.delivered()} failed=${p.failed()} left=${left}")
+}
+
+// Prints each message before committing it, so a line can be repeated after a
+// crash but a committed message always has its line.
+fn consuming(brokers: string, topic: string, group: string, idleMs: int): void throws kafka.KafkaError {
+    let config: map[string, string] = {}
+    config.set("bootstrap.servers", brokers)
+    config.set("group.id", group)
+    config.set("log_level", "2")
+    let c: kafka.Consumer = kafka.consumerWith(config)
+    let topics: string[] = [topic]
+    c.subscribe(topics)
+    let idleSince: long = time.now()
+    let handled: int = 0
+    while (time.now() - idleSince < idleMs) {
+        let m: kafka.Message? = c.poll(500)
+        if (m != null) {
+            fmt.println("MSG ${m.key} ${m.value} ${m.partition} ${m.offset}")
+            handled = handled + 1
+            idleSince = time.now()
+            if (handled % 100 == 0) {
+                commit(c)
+            }
+        }
+    }
+
+    commit(c)
+    c.close()
+}
+
+fn commit(c: kafka.Consumer): void {
+    try {
+        c.commit()
+    } catch (e: kafka.KafkaError) {
+        if (!kafka.isRebalance(e.code)) {
+            fmt.println("commit: " + e.message)
+        }
+    }
+}
+
+fn main(): void {
+    let a: string[] = os.args()
+    try {
+        if (a[0] == "produce") {
+            producing(a[1], a[2], str.toInt(a[3]))
+        } else {
+            consuming(a[1], a[2], a[3], str.toInt(a[4]))
+        }
+    } catch (e: kafka.KafkaError) {
+        fmt.println("FAILED " + e.message + " " + kafka.errorName(e.code))
+        os.exit(1)
+    }
+}

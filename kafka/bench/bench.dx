@@ -1,0 +1,137 @@
+// Throughput against KAFKA_BROKERS, or localhost:9092, on a topic of its own that
+// it removes afterwards. With a single replica and localhost, this measures the
+// client more than the broker, which is the point.
+
+import "crypto"
+import "fmt"
+import "num"
+import "os"
+import "str"
+import "time"
+import "github.com/ensamuel7/dex-modules/kafka"
+
+const PREFIX: string = "dexkafka.test.bench."
+
+fn rate(n: int, startedNs: long): long {
+    let ms: long = (time.nowNs() - startedNs) / 1000000
+    if (ms == 0) {
+        ms = 1
+    }
+
+    return num.toLong(n) * 1000 / ms
+}
+
+fn produceThroughput(brokers: string, topic: string, value: string, n: int): long throws kafka.KafkaError {
+    let p: kafka.Producer = kafka.producer(brokers)
+    let t0: long = time.nowNs()
+    for (let i: int = 0; i < n; i++) {
+        p.produce(topic, "key", value)
+    }
+
+    assert(p.flush(120000) == 0)
+    let r: long = rate(n, t0)
+    assert(p.failed() == 0)
+    p.close()
+    return r
+}
+
+fn consumeThroughput(brokers: string, topic: string, n: int): long throws kafka.KafkaError {
+    let c: kafka.Consumer = kafka.consumer(brokers, PREFIX + "group." + str.fromLong(time.nowNs()))
+    let topics: string[] = [topic]
+    c.subscribe(topics)
+    let first: kafka.Message? = c.poll(30000)
+    assert(first != null)
+    let t0: long = time.nowNs()
+    let got: int = 1
+    let bytes: long = 0
+    while (got < n) {
+        let m: kafka.Message? = c.poll(10000)
+        assert(m != null)
+        if (m != null) {
+            bytes = bytes + num.toLong(m.value.len() + m.key.len())
+        }
+
+        got = got + 1
+    }
+
+    let r: long = rate(n, t0)
+    assert(bytes > 0)
+    c.close()
+    return r
+}
+
+fn run(brokers: string): void throws kafka.KafkaError {
+    let a: kafka.Admin = kafka.admin(brokers)
+    let topic: string = PREFIX + str.fromLong(time.nowNs())
+    a.createTopic(topic, 3, 1)
+    time.sleep(1000)
+
+    let sb = StringBuilder()
+    for (let i: int = 0; i < 100; i++) {
+        sb.append('x')
+    }
+
+    let n: int = 1000000
+    let value: string = sb.toString()
+    fmt.println("produce 100B:   ${produceThroughput(brokers, topic, value, n)} msg/s")
+    fmt.println("consume 100B:   ${consumeThroughput(brokers, topic, n)} msg/s")
+
+    // A kilobyte of bytes: all text, a NUL every 16 bytes as a binary format
+    // might have, and all NULs. A NUL makes bytes cross C a piece at a time.
+    let nul: string = crypto.base64Decode("AA==")
+    let kb = StringBuilder()
+    for (let i: int = 0; i < 1024; i++) {
+        kb.append('x')
+    }
+
+    let text: string = kb.toString()
+    kb.clear()
+    for (let i: int = 0; i < 1024; i++) {
+        if (i % 16 == 0) {
+            kb.append(nul)
+        } else {
+            kb.append('x')
+        }
+    }
+
+    let sparse: string = kb.toString()
+    kb.clear()
+    for (let i: int = 0; i < 1024; i++) {
+        kb.append(nul)
+    }
+
+    let zeros: string = kb.toString()
+    let m: int = 50000
+    let topic2: string = topic + ".text"
+    let topic3: string = topic + ".sparse"
+    let topic4: string = topic + ".zeros"
+    a.createTopic(topic2, 1, 1)
+    a.createTopic(topic3, 1, 1)
+    a.createTopic(topic4, 1, 1)
+    time.sleep(1000)
+    produceThroughput(brokers, topic2, text, m)
+    produceThroughput(brokers, topic3, sparse, m)
+    produceThroughput(brokers, topic4, zeros, m)
+    fmt.println("consume 1KB text:              ${consumeThroughput(brokers, topic2, m)} msg/s")
+    fmt.println("consume 1KB, NUL every 16:     ${consumeThroughput(brokers, topic3, m)} msg/s")
+    fmt.println("consume 1KB, all NUL:          ${consumeThroughput(brokers, topic4, m)} msg/s")
+
+    a.deleteTopic(topic)
+    a.deleteTopic(topic2)
+    a.deleteTopic(topic3)
+    a.deleteTopic(topic4)
+}
+
+fn main(): void {
+    let brokers: string = os.env("KAFKA_BROKERS")
+    if (brokers.isEmpty()) {
+        brokers = "localhost:9092"
+    }
+
+    try {
+        run(brokers)
+    } catch (e: kafka.KafkaError) {
+        fmt.println(e.message)
+        os.exit(1)
+    }
+}

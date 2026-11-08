@@ -30,7 +30,7 @@ while (running) {
 c.close()
 ```
 
-Needs **dex 0.9.31 or later**, which `dex.mod` records.
+Needs **dex 0.9.33 or later**, which `dex.mod` records.
 
 Every failed call throws `kafka.KafkaError`, carrying `message`, `code`, and whether
 it is `fatal` (make a new client), `retriable` (the same call may work), or
@@ -206,14 +206,16 @@ than having several, since their messages batch together. A **consumer is polled
 one thread at a time**; to read in parallel, give each thread its own consumer in the
 same group. `Message`s can go anywhere.
 
-Put a thread's work in a named function. A `spawn` block that uses a variable only
-inside a `try`, a `switch` or a `throw` does not capture it yet
-([problem 017](../../dex-samples/problems/017-spawn-lambda-capture-misses-statements.md)),
-and the error comes from the C compiler:
-
 ```dex
-spawn {
-    send(done, consumeOrders(brokers, group))    // everything arrives as an argument
+let p: kafka.Producer = kafka.producer(brokers)
+for (let w: int = 0; w < 8; w++) {
+    spawn {
+        try {
+            p.produce("events", "", event(w))     // one producer, shared
+        } catch (e: kafka.KafkaError) {
+            report(e)
+        }
+    }
 }
 ```
 
@@ -225,6 +227,10 @@ Dex to pull: a thread of its own serves a producer's delivery reports, as the po
 goroutine does in confluent-kafka-go, and a consumer's are served by `poll`. A rebalance
 is applied in the callback, including cooperative ones, and reported through
 `rebalances()`, so you see it but cannot veto or delay it.
+
+A message's bytes cross straight from librdkafka's buffer into a Dex `string`, by
+length (`sized by` in the external declaration), so one copy is made and a NUL
+anywhere is kept.
 
 ## How it has been tested
 
@@ -276,16 +282,23 @@ with a broker on localhost, so this measures the client more than the broker:
 
 | msg/s | this package | confluent-kafka-go 2.16.1 |
 |---|---|---|
-| produce | 830,000 to 900,000 | 730,000 to 790,000 |
-| consume | about 406,000 | about 220,000 |
+| produce | 590,000 to 900,000 | 730,000 to 790,000 |
+| consume | 400,000 to 2,300,000 | about 220,000 |
 
-Both are librdkafka 2.16.0, so the producer's real work is the same code; the difference
-is the cost of crossing into it. `bench/bench.dx` is the Dex side. This is a reference
-point on one machine, not a claim about every workload.
+Both are librdkafka 2.16.0, so the work underneath is the same code; the difference
+is the cost of crossing into it. Consuming spreads widely because the client is no
+longer what limits it: the result depends on how much librdkafka had fetched ahead
+when timing began. The Go numbers were measured on an earlier day, on the same
+machine and broker. `bench/bench.dx` is the Dex side. This is a reference point on
+one machine, not a claim about every workload.
 
-Bytes holding NUL cross more slowly, a piece at a time
-([problem 019](../../dex-samples/problems/019-bytes-from-c.md)): at 1 KB, about 380,000
-msg/s with a NUL every 16 bytes, and 70,000 when all NUL, against 510,000 and up for text.
+A payload's bytes cost the same whatever they hold. At 1 KB, from three runs of each
+build, alternating:
+
+| msg/s | text | a NUL every 16 bytes | all NUL |
+|---|---|---|---|
+| now | 420,000 to 620,000 | 330,000 to 520,000 | 450,000 to 670,000 |
+| before `sized by` (dex 0.9.31) | 450,000 to 620,000 | 335,000 to 360,000 | 45,000 to 70,000 |
 
 ## Compared with confluent-kafka-go
 
@@ -301,16 +314,3 @@ The same library underneath, so the same protocol support and behaviour. Here:
   (both need callbacks into Dex), a rebalance callback that can act before partitions
   move (`rebalances()` reports afterwards), and a log channel (librdkafka logs to stderr,
   and `log_level` sets how much).
-
-## Shaped around the compiler
-
-Each has a comment at its spot, and is worth removing once fixed:
-
-- Each `Producer`, `Consumer` and `Admin` method reads `self.h` into a local first.
-  Passing `self.h` to a function counts as writing `self`, and a throw then leaks the
-  client ([problem 006](../../dex-samples/problems/006-unwind-leaks-around-method-calls.md)).
-- Default timeouts repeat `30000` rather than naming a constant
-  ([problem 018](../../dex-samples/problems/018-default-argument-scope.md)).
-- `producer` and `producerWith` are two functions, because a map parameter cannot
-  default to `{}` ([problem 011](../../dex-samples/problems/011-empty-array-literal-expected-type.md)).
-- `bytesOf` rebuilds bytes a piece at a time ([problem 019](../../dex-samples/problems/019-bytes-from-c.md)).

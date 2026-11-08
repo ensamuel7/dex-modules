@@ -265,27 +265,6 @@ fn keyOrder(a: kafka.Admin): void throws kafka.KafkaError {
     p.close()
 }
 
-fn produceMany(p: kafka.Producer, t: string, w: int, each: int): int {
-    let bad: int = 0
-    for (let i: int = 0; i < each; i++) {
-        try {
-            let value: string = str.fromInt(w) + ":" + str.fromInt(i)
-            if (i % 100 == 0) {
-                let d: kafka.Delivery = p.produceSync(kafka.message(t, value))
-                if (!d.ok()) {
-                    bad = bad + 1
-                }
-            } else {
-                p.produce(t, "", value)
-            }
-        } catch (e: kafka.KafkaError) {
-            bad = bad + 1
-        }
-    }
-
-    return bad
-}
-
 // One producer shared by threads, every message arriving exactly once.
 fn sharedProducer(a: kafka.Admin): void throws kafka.KafkaError {
     let t: string = topic(a, "shared", 3)
@@ -294,8 +273,27 @@ fn sharedProducer(a: kafka.Admin): void throws kafka.KafkaError {
     let each: int = 1000
     let done = channel(int)
     for (let w: int = 0; w < threads; w++) {
+        // Inline, with the try inside the spawn: this shape once failed to
+        // capture p, t and each (problem 017), so it stays written this way.
         spawn {
-            send(done, produceMany(p, t, w, each))
+            let bad: int = 0
+            for (let i: int = 0; i < each; i++) {
+                try {
+                    let value: string = str.fromInt(w) + ":" + str.fromInt(i)
+                    if (i % 100 == 0) {
+                        let d: kafka.Delivery = p.produceSync(kafka.message(t, value))
+                        if (!d.ok()) {
+                            bad = bad + 1
+                        }
+                    } else {
+                        p.produce(t, "", value)
+                    }
+                } catch (e: kafka.KafkaError) {
+                    bad = bad + 1
+                }
+            }
+
+            send(done, bad)
         }
     }
 

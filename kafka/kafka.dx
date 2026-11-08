@@ -4,10 +4,6 @@
 // fields, so copies of one share the client, and it can be used from any number
 // of threads. The client closes when the last copy goes.
 //
-// Each of their methods reads the handle into a local first. The compiler takes
-// a method passing self.h to anything as one that writes self, and a throw out of
-// such a call leaks what self holds, which here would keep the client open.
-//
 // A Message is plain data, copied out of librdkafka at poll time. librdkafka's
 // rd_kafka_destroy waits on messages still held, and refcounting cannot say that
 // a message depends on its client, so nothing here lets one outlive it.
@@ -146,13 +142,7 @@ external module rd {
     fn msgTimestamp(m: Msg): long = "kafka_shim_msg_timestamp"
     fn msgHeaderCount(m: Msg): int = "kafka_shim_msg_header_count"
     fn msgHeaderName(m: Msg, i: int): string = "kafka_shim_msg_header_name"
-    fn partIsNull(m: Msg, part: int): bool = "kafka_shim_part_is_null"
-    fn partHasNul(m: Msg, part: int): bool = "kafka_shim_part_has_nul"
-    fn partText(m: Msg, part: int): string = "kafka_shim_part_text"
-    fn segBegin(m: Msg, part: int): void = "kafka_shim_seg_begin"
-    fn segMore(m: Msg): bool = "kafka_shim_seg_more"
-    fn segNext(m: Msg): string = "kafka_shim_seg_next"
-    fn nul(): char = "kafka_shim_nul"
+    fn partBytes(m: Msg, part: int, n: &long): string sized by n = "kafka_shim_part_bytes"
 
     fn newTopic(name: string, partitions: int, replicas: int): NewTopic? = "kafka_shim_new_topic"
     fn newTopicSet(t: NewTopic, key: string, value: string): int = "kafka_shim_new_topic_set"
@@ -190,6 +180,9 @@ const KIND_ADMIN: int = 2
 const PART_KEY: int = 0
 const PART_VALUE: int = 1
 const PART_HEADER: int = 2
+
+// How long a call that waits on the cluster waits, unless told otherwise.
+const DEFAULT_TIMEOUT_MS: int = 30000
 
 // Let the partitioner choose, by the key's hash, or spread keyless messages.
 const PARTITION_ANY: int = -1
@@ -398,24 +391,21 @@ struct Consumer {
 
     // Join the group for these topics. A name starting with ^ is a regex.
     fn subscribe(topics: string[]): void throws KafkaError {
-        let h: Client = self.h
         let l: Parts = rd.listNew(topics.len())
         foreach (topics as t) {
             rd.listAdd(l, t, PARTITION_ANY, OFFSET_INVALID)
         }
 
-        check(rd.subscribe(h, l))
+        check(rd.subscribe(self.h, l))
     }
 
     fn unsubscribe(): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.unsubscribe(h))
+        check(rd.unsubscribe(self.h))
     }
 
     fn subscription(): string[] throws KafkaError {
-        let h: Client = self.h
         let names: string[] = []
-        foreach (partsOf(rd.subscription(h)) as tp) {
+        foreach (partsOf(rd.subscription(self.h)) as tp) {
             names.push(tp.topic)
         }
 
@@ -425,18 +415,15 @@ struct Consumer {
     // Read these partitions directly, outside any group rebalancing. An offset
     // of OFFSET_STORED resumes from the group's commit.
     fn assign(partitions: TopicPartition[]): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.assign(h, listOf(partitions)))
+        check(rd.assign(self.h, listOf(partitions)))
     }
 
     fn unassign(): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.assign(h, null))
+        check(rd.assign(self.h, null))
     }
 
     fn assignment(): TopicPartition[] throws KafkaError {
-        let h: Client = self.h
-        return partsOf(rd.assignment(h))
+        return partsOf(rd.assignment(self.h))
     }
 
     // The next message, or null after timeoutMs. This is also what keeps the
@@ -448,18 +435,16 @@ struct Consumer {
     // enable.partition.eof set, the end of a partition comes back as a Message
     // with eof true and no contents.
     fn poll(timeoutMs: int): Message? throws KafkaError {
-        let h: Client = self.h
-        return pollOne(h, timeoutMs)
+        return pollOne(self.h, timeoutMs)
     }
 
     // Up to max messages, waiting up to timeoutMs for the first and then taking
     // only what has already arrived.
     fn pollBatch(max: int, timeoutMs: int): Message[] throws KafkaError {
-        let h: Client = self.h
         let out: Message[] = []
         let wait: int = timeoutMs
         while (out.len() < max) {
-            let m: Message? = pollOne(h, wait)
+            let m: Message? = self.poll(wait)
             if (m == null) {
                 break
             }
@@ -475,100 +460,93 @@ struct Consumer {
     // everything stored), and wait for the broker. Do this after handling what
     // was polled: a crash then replays it rather than losing it.
     fn commit(): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.commitStored(h, false))
+        check(rd.commitStored(self.h, false))
     }
 
     // As commit, without waiting. A failure arrives through errors.
     fn commitAsync(): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.commitStored(h, true))
+        check(rd.commitStored(self.h, true))
     }
 
     // Commit up to and including this message, and wait for the broker. A commit
     // made during a rebalance can fail: see isRebalance.
     fn commitMessage(m: Message): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.commitList(h, nextAfter(m), false))
+        check(rd.commitList(self.h, nextAfter(m), false))
     }
 
     // Commit these offsets as given: the offset is the next one to read.
     fn commitOffsets(partitions: TopicPartition[]): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.commitList(h, listOf(partitions), false))
+        check(rd.commitList(self.h, listOf(partitions), false))
     }
 
     // Mark this message handled, for the next commit or auto-commit to pick up.
     // With enable.auto.offset.store off this is the at-least-once pattern at
     // high throughput: no round trip per message.
     fn store(m: Message): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.store(h, nextAfter(m)))
+        check(rd.store(self.h, nextAfter(m)))
     }
 
     // Move an assigned partition's reading position.
-    fn seek(topic: string, partition: int, offset: long, timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
+    fn seek(topic: string, partition: int, offset: long, timeoutMs: int = DEFAULT_TIMEOUT_MS): void throws KafkaError {
         let l: Parts = rd.listNew(1)
         rd.listAdd(l, topic, partition, offset)
-        check(rd.seek(h, l, timeoutMs))
+        check(rd.seek(self.h, l, timeoutMs))
     }
 
     // Stop fetching these partitions while staying in the group, for when
     // whatever the messages feed cannot keep up. Keep polling meanwhile.
     fn pause(partitions: TopicPartition[]): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.pause(h, listOf(partitions)))
+        check(rd.pause(self.h, listOf(partitions)))
     }
 
     fn resume(partitions: TopicPartition[]): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.resume(h, listOf(partitions)))
+        check(rd.resume(self.h, listOf(partitions)))
     }
 
     // The next offset this consumer will read in each partition, or
     // OFFSET_INVALID before it has read any.
     fn position(partitions: TopicPartition[]): TopicPartition[] throws KafkaError {
-        let h: Client = self.h
         let l: Parts = listOf(partitions)
-        check(rd.position(h, l))
+        check(rd.position(self.h, l))
         return readParts(l)
     }
 
     // The group's committed offset in each partition, or OFFSET_INVALID.
-    fn committed(partitions: TopicPartition[], timeoutMs: int = 30000): TopicPartition[] throws KafkaError {
-        let h: Client = self.h
+    fn committed(
+        partitions: TopicPartition[],
+        timeoutMs: int = DEFAULT_TIMEOUT_MS
+    ): TopicPartition[] throws KafkaError {
         let l: Parts = listOf(partitions)
-        check(rd.committed(h, l, timeoutMs))
+        check(rd.committed(self.h, l, timeoutMs))
         return readParts(l)
     }
 
     // Asks with a timestamp in milliseconds as each offset, and answers with the
     // first offset at or after it, or OFFSET_END if there is none.
-    fn offsetsForTimes(partitions: TopicPartition[], timeoutMs: int = 30000): TopicPartition[] throws KafkaError {
-        let h: Client = self.h
+    fn offsetsForTimes(
+        partitions: TopicPartition[],
+        timeoutMs: int = DEFAULT_TIMEOUT_MS
+    ): TopicPartition[] throws KafkaError {
         let l: Parts = listOf(partitions)
-        check(rd.offsetsForTimes(h, l, timeoutMs))
+        check(rd.offsetsForTimes(self.h, l, timeoutMs))
         return readParts(l)
     }
 
     // The first offset still held and the one after the last, from the broker.
-    fn watermarks(topic: string, partition: int, timeoutMs: int = 30000): Watermarks throws KafkaError {
-        let h: Client = self.h
+    fn watermarks(topic: string, partition: int, timeoutMs: int = DEFAULT_TIMEOUT_MS): Watermarks throws KafkaError {
         let low: long = 0
         let high: long = 0
-        check(rd.watermarks(h, topic, partition, low, high, timeoutMs))
+        check(rd.watermarks(self.h, topic, partition, low, high, timeoutMs))
         return Watermarks { low: low, high: high }
     }
 
     // Partitions gained and lost since last asked, oldest first. The assignment
     // has already been applied; this is for a program to see it happen.
     fn rebalances(): Rebalance[] throws KafkaError {
-        let h: Client = self.h
         let out: Rebalance[] = []
-        while (rd.rebalancePeek(h)) {
+        while (rd.rebalancePeek(self.h)) {
             let kind: int = 0
-            let l: Parts? = rd.rebalanceTake(h, kind)
+            let l: Parts? = rd.rebalanceTake(self.h, kind)
             out.push(Rebalance { partitions: partsOf(l), kind: kind })
         }
 
@@ -576,33 +554,28 @@ struct Consumer {
     }
 
     fn memberId(): string {
-        let h: Client = self.h
-        return rd.memberId(h)
+        return rd.memberId(self.h)
     }
 
     fn errors(): ClientError[] {
-        let h: Client = self.h
-        return drainErrors(h)
+        return drainErrors(self.h)
     }
 
     // The newest statistics JSON, if statistics.interval.ms is set.
     fn stats(): string {
-        let h: Client = self.h
-        return rd.stats(h)
+        return rd.stats(self.h)
     }
 
     // Make a poll in progress on another thread return now, with null.
     fn wake(): void {
-        let h: Client = self.h
-        rd.wake(h)
+        rd.wake(self.h)
     }
 
     // Commit if auto-commit is on, leave the group so that it rebalances at once
     // rather than after session.timeout.ms, and stop. Polling afterwards throws.
     // Letting the last reference go does the same.
     fn close(): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.consumerClose(h))
+        check(rd.consumerClose(self.h))
     }
 }
 
@@ -616,22 +589,20 @@ struct Producer {
     // backpressure that keeps a fast producer from outrunning the broker. A key
     // of "" sends no key. See delivered, failed and errors for how it went.
     fn produce(topic: string, key: string, value: string): void throws KafkaError {
-        let h: Client = self.h
         let keyLen: int = key.len()
         if (keyLen == 0) {
             keyLen = -1
         }
 
-        check(rd.produce(h, topic, PARTITION_ANY, key, keyLen, value, value.len(), 0, null, true))
+        check(rd.produce(self.h, topic, PARTITION_ANY, key, keyLen, value, value.len(), 0, null, true))
     }
 
     // As produce, for a message with headers, a partition, a timestamp, a
     // binary or empty key, or a tombstone.
     fn produceMessage(m: Message): void throws KafkaError {
-        let h: Client = self.h
         check(
             rd.produce(
-                h,
+                self.h,
                 m.topic,
                 m.partition,
                 m.key,
@@ -647,9 +618,8 @@ struct Producer {
 
     // As produceMessage, but false rather than waiting when the queue is full.
     fn tryProduce(m: Message): bool throws KafkaError {
-        let h: Client = self.h
         let rc: int = rd.produce(
-            h,
+            self.h,
             m.topic,
             m.partition,
             m.key,
@@ -672,14 +642,13 @@ struct Producer {
     // messages share its batches, so this costs latency rather than throughput
     // when many threads do it. Waits up to message.timeout.ms.
     fn produceSync(m: Message): Delivery throws KafkaError {
-        let h: Client = self.h
         let partition: int = 0
         let offset: long = 0
         let timestamp: long = 0
         let status: int = 0
         check(
             rd.produceSync(
-                h,
+                self.h,
                 m.topic,
                 m.partition,
                 m.key,
@@ -709,10 +678,9 @@ struct Producer {
     // Queue a message whose outcome is wanted, reported under tag by
     // nextDelivery. Reports wait until read, so read them.
     fn produceTracked(m: Message, tag: long): void throws KafkaError {
-        let h: Client = self.h
         check(
             rd.produceTracked(
-                h,
+                self.h,
                 m.topic,
                 m.partition,
                 m.key,
@@ -728,8 +696,7 @@ struct Producer {
 
     // The next report of a produceTracked message, or null after timeoutMs.
     fn nextDelivery(timeoutMs: int): Delivery? {
-        let h: Client = self.h
-        let r: Report? = rd.reportNext(h, timeoutMs)
+        let r: Report? = rd.reportNext(self.h, timeoutMs)
         if (r == null) {
             return null
         }
@@ -747,71 +714,59 @@ struct Producer {
     }
 
     // Wait for everything queued. Returns how many are still undelivered.
-    fn flush(timeoutMs: int = 30000): int {
-        let h: Client = self.h
-        return rd.flush(h, timeoutMs)
+    fn flush(timeoutMs: int = DEFAULT_TIMEOUT_MS): int {
+        return rd.flush(self.h, timeoutMs)
     }
 
     // Messages queued or awaiting the broker's answer.
     fn queued(): int {
-        let h: Client = self.h
-        return rd.queued(h)
+        return rd.queued(self.h)
     }
 
     fn delivered(): long {
-        let h: Client = self.h
-        return rd.delivered(h)
+        return rd.delivered(self.h)
     }
 
     fn failed(): long {
-        let h: Client = self.h
-        return rd.failed(h)
+        return rd.failed(self.h)
     }
 
     fn errors(): ClientError[] {
-        let h: Client = self.h
-        return drainErrors(h)
+        return drainErrors(self.h)
     }
 
     // The newest statistics JSON, if statistics.interval.ms is set.
     fn stats(): string {
-        let h: Client = self.h
-        return rd.stats(h)
+        return rd.stats(self.h)
     }
 
     // Flush, then fail whatever is left. Returns how many were not delivered.
     // Letting the last reference go does the same with five seconds to flush.
-    fn close(timeoutMs: int = 30000): int {
-        let h: Client = self.h
-        return rd.producerClose(h, timeoutMs)
+    fn close(timeoutMs: int = DEFAULT_TIMEOUT_MS): int {
+        return rd.producerClose(self.h, timeoutMs)
     }
 
     // Transactions need transactional.id. Call this once, before the first.
-    fn initTransactions(timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.txnInit(h, timeoutMs))
+    fn initTransactions(timeoutMs: int = DEFAULT_TIMEOUT_MS): void throws KafkaError {
+        check(rd.txnInit(self.h, timeoutMs))
     }
 
     fn beginTransaction(): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.txnBegin(h))
+        check(rd.txnBegin(self.h))
     }
 
-    fn commitTransaction(timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.txnCommit(h, timeoutMs))
+    fn commitTransaction(timeoutMs: int = DEFAULT_TIMEOUT_MS): void throws KafkaError {
+        check(rd.txnCommit(self.h, timeoutMs))
     }
 
-    fn abortTransaction(timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.txnAbort(h, timeoutMs))
+    fn abortTransaction(timeoutMs: int = DEFAULT_TIMEOUT_MS): void throws KafkaError {
+        check(rd.txnAbort(self.h, timeoutMs))
     }
 
     // Make a consumer's current positions part of the open transaction, so the
     // input is marked read exactly when the output becomes visible.
-    fn sendOffsets(from: Consumer, timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.txnSendOffsets(h, from.handle(), timeoutMs))
+    fn sendOffsets(from: Consumer, timeoutMs: int = DEFAULT_TIMEOUT_MS): void throws KafkaError {
+        check(rd.txnSendOffsets(self.h, from.handle(), timeoutMs))
     }
 }
 
@@ -820,15 +775,19 @@ struct Producer {
 struct Admin {
     private h: Client
 
-    fn createTopic(name: string, partitions: int, replicas: int, timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
+    fn createTopic(
+        name: string,
+        partitions: int,
+        replicas: int,
+        timeoutMs: int = DEFAULT_TIMEOUT_MS
+    ): void throws KafkaError {
         let t: NewTopic? = rd.newTopic(name, partitions, replicas)
         if (t == null) {
             raise(ERR_INVALID_ARG)
             return
         }
 
-        check(rd.createTopic(h, t, timeoutMs))
+        check(rd.createTopic(self.h, t, timeoutMs))
     }
 
     // As createTopic, with topic settings such as cleanup.policy.
@@ -837,9 +796,8 @@ struct Admin {
         partitions: int,
         replicas: int,
         settings: map[string, string],
-        timeoutMs: int = 30000
+        timeoutMs: int = DEFAULT_TIMEOUT_MS
     ): void throws KafkaError {
-        let h: Client = self.h
         let t: NewTopic? = rd.newTopic(name, partitions, replicas)
         if (t == null) {
             raise(ERR_INVALID_ARG)
@@ -850,25 +808,22 @@ struct Admin {
             check(rd.newTopicSet(t, k, settings[k]))
         }
 
-        check(rd.createTopic(h, t, timeoutMs))
+        check(rd.createTopic(self.h, t, timeoutMs))
     }
 
-    fn deleteTopic(name: string, timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.deleteTopic(h, name, timeoutMs))
+    fn deleteTopic(name: string, timeoutMs: int = DEFAULT_TIMEOUT_MS): void throws KafkaError {
+        check(rd.deleteTopic(self.h, name, timeoutMs))
     }
 
     // Grow a topic to this many partitions. Keys already written do not move, so
     // a key's new messages may land apart from its old ones.
-    fn createPartitions(name: string, total: int, timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.createPartitions(h, name, total, timeoutMs))
+    fn createPartitions(name: string, total: int, timeoutMs: int = DEFAULT_TIMEOUT_MS): void throws KafkaError {
+        check(rd.createPartitions(self.h, name, total, timeoutMs))
     }
 
     // Brokers and topics. A topic of "" asks about all of them.
-    fn cluster(topic: string = "", timeoutMs: int = 30000): ClusterInfo throws KafkaError {
-        let h: Client = self.h
-        let m: Meta? = rd.metaGet(h, topic, timeoutMs)
+    fn cluster(topic: string = "", timeoutMs: int = DEFAULT_TIMEOUT_MS): ClusterInfo throws KafkaError {
+        let m: Meta? = rd.metaGet(self.h, topic, timeoutMs)
         if (m == null) {
             raise(ERR_TIMED_OUT)
             return ClusterInfo { brokers: [], topics: [] }
@@ -904,10 +859,9 @@ struct Admin {
     }
 
     // Consumer groups. A group of "" asks about all of them.
-    fn groups(group: string = "", timeoutMs: int = 30000): GroupInfo[] throws KafkaError {
-        let h: Client = self.h
+    fn groups(group: string = "", timeoutMs: int = DEFAULT_TIMEOUT_MS): GroupInfo[] throws KafkaError {
         let out: GroupInfo[] = []
-        let g: Groups? = rd.groupsGet(h, group, timeoutMs)
+        let g: Groups? = rd.groupsGet(self.h, group, timeoutMs)
         if (g == null) {
             raise(ERR_TIMED_OUT)
             return out
@@ -927,14 +881,12 @@ struct Admin {
         return out
     }
 
-    fn deleteGroup(group: string, timeoutMs: int = 30000): void throws KafkaError {
-        let h: Client = self.h
-        check(rd.deleteGroup(h, group, timeoutMs))
+    fn deleteGroup(group: string, timeoutMs: int = DEFAULT_TIMEOUT_MS): void throws KafkaError {
+        check(rd.deleteGroup(self.h, group, timeoutMs))
     }
 
     fn errors(): ClientError[] {
-        let h: Client = self.h
-        return drainErrors(h)
+        return drainErrors(self.h)
     }
 }
 
@@ -1010,7 +962,7 @@ fn message(topic: string, value: string): Message {
         topic: topic,
         key: "",
         value: value,
-        headers: noHeaders(),
+        headers: [],
         offset: OFFSET_INVALID,
         timestamp: 0,
         partition: PARTITION_ANY,
@@ -1026,7 +978,7 @@ fn tombstone(topic: string, key: string): Message {
         topic: topic,
         key: key,
         value: "",
-        headers: noHeaders(),
+        headers: [],
         offset: OFFSET_INVALID,
         timestamp: 0,
         partition: PARTITION_ANY,
@@ -1094,11 +1046,6 @@ private fn copyOf(config: map[string, string]): map[string, string] {
     }
 
     return out
-}
-
-private fn noHeaders(): Header[] {
-    let none: Header[] = []
-    return none
 }
 
 private fn keyLenOf(m: Message): int {
@@ -1196,7 +1143,7 @@ private fn readMessage(h: Client, m: Msg): Message throws KafkaError {
             topic: rd.msgTopic(m),
             key: "",
             value: "",
-            headers: noHeaders(),
+            headers: [],
             offset: rd.msgOffset(m),
             timestamp: 0,
             partition: rd.msgPartition(m),
@@ -1213,37 +1160,25 @@ private fn readMessage(h: Client, m: Msg): Message throws KafkaError {
     let headers: Header[] = []
     let n: int = rd.msgHeaderCount(m)
     for (let i: int = 0; i < n; i++) {
-        headers.push(Header { name: rd.msgHeaderName(m, i), value: bytesOf(m, PART_HEADER + i) })
+        let size: long = 0
+        headers.push(Header { name: rd.msgHeaderName(m, i), value: rd.partBytes(m, PART_HEADER + i, size) })
     }
 
+    // A count of -1 is NULL, which differs from empty.
+    let keyLen: long = 0
+    let key: string = rd.partBytes(m, PART_KEY, keyLen)
+    let valueLen: long = 0
+    let value: string = rd.partBytes(m, PART_VALUE, valueLen)
     return Message {
         topic: rd.msgTopic(m),
-        key: bytesOf(m, PART_KEY),
-        value: bytesOf(m, PART_VALUE),
+        key: key,
+        value: value,
         headers: headers,
         offset: rd.msgOffset(m),
         timestamp: rd.msgTimestamp(m),
         partition: rd.msgPartition(m),
-        hasKey: !rd.partIsNull(m, PART_KEY),
-        hasValue: !rd.partIsNull(m, PART_VALUE),
+        hasKey: keyLen >= 0,
+        hasValue: valueLen >= 0,
         eof: false
     }
-}
-
-// A string returned from C is read with strlen, so bytes holding a NUL cross a
-// piece at a time, split at each NUL, and are put back together here.
-private fn bytesOf(m: Msg, part: int): string {
-    if (!rd.partHasNul(m, part)) {
-        return rd.partText(m, part)
-    }
-
-    let sb = StringBuilder()
-    rd.segBegin(m, part)
-    sb.append(rd.segNext(m))
-    while (rd.segMore(m)) {
-        sb.append(rd.nul())
-        sb.append(rd.segNext(m))
-    }
-
-    return sb.toString()
 }

@@ -1,8 +1,8 @@
 #ifndef KAFKA_SHIM_H
 #define KAFKA_SHIM_H
 
-// What Dex cannot say to librdkafka directly: C callbacks, struct fields,
-// varargs, and bytes that are not a NUL-terminated string.
+// What Dex cannot say to librdkafka directly: C callbacks, struct fields and
+// varargs.
 //
 // Dex cannot be called back from C (a throw is a longjmp, and it would cross
 // the C frames), so every librdkafka callback lands here and leaves its result
@@ -902,11 +902,6 @@ static inline rd_kafka_topic_partition_list_t *kafka_shim_rebalance_take(kafka_s
 typedef struct {
     rd_kafka_message_t *m;
     rd_kafka_headers_t *headers; // owned by m
-    char *buf;
-    size_t cap;
-    const char *seg;
-    size_t seg_left;
-    int seg_more;
 } kafka_shim_msg;
 
 static inline kafka_shim_msg *kafka_shim_poll(kafka_shim_client *c, int timeoutMs) {
@@ -921,11 +916,6 @@ static inline kafka_shim_msg *kafka_shim_poll(kafka_shim_client *c, int timeoutM
     }
     out->m = m;
     out->headers = NULL;
-    out->buf = NULL;
-    out->cap = 0;
-    out->seg = NULL;
-    out->seg_left = 0;
-    out->seg_more = 0;
     if (m->err == 0) {
         rd_kafka_message_headers(m, &out->headers);
     }
@@ -934,7 +924,6 @@ static inline kafka_shim_msg *kafka_shim_poll(kafka_shim_client *c, int timeoutM
 
 static inline void kafka_shim_msg_free(kafka_shim_msg *m) {
     rd_kafka_message_destroy(m->m);
-    free(m->buf);
     free(m);
 }
 
@@ -971,93 +960,29 @@ static inline const char *kafka_shim_msg_header_name(kafka_shim_msg *m, int i) {
     return name;
 }
 
-static inline void kafka_shim_part(kafka_shim_msg *m, int part, const char **ptr, size_t *len) {
+// A part's bytes, in librdkafka's own buffer, with their count written to *n:
+// -1 for NULL, which Dex reads as "" and which is how a missing key and a
+// tombstone's value differ from empty ones. Dex copies exactly *n bytes, so a
+// NUL anywhere in them is kept.
+static inline const char *kafka_shim_part_bytes(kafka_shim_msg *m, int part, long *n) {
+    const char *ptr;
+    size_t len;
     if (part == KAFKA_SHIM_PART_KEY) {
-        *ptr = m->m->key;
-        *len = m->m->key_len;
+        ptr = m->m->key;
+        len = m->m->key_len;
     } else if (part == KAFKA_SHIM_PART_VALUE) {
-        *ptr = m->m->payload;
-        *len = m->m->len;
+        ptr = m->m->payload;
+        len = m->m->len;
     } else {
         const char *name;
         const void *value = NULL;
         size_t size = 0;
         rd_kafka_header_get_all(m->headers, (size_t)(part - KAFKA_SHIM_PART_HEADER), &name, &value, &size);
-        *ptr = value;
-        *len = size;
+        ptr = value;
+        len = size;
     }
-}
-
-static inline bool kafka_shim_part_is_null(kafka_shim_msg *m, int part) {
-    const char *ptr;
-    size_t len;
-    kafka_shim_part(m, part, &ptr, &len);
-    return ptr == NULL;
-}
-
-static inline bool kafka_shim_part_has_nul(kafka_shim_msg *m, int part) {
-    const char *ptr;
-    size_t len;
-    kafka_shim_part(m, part, &ptr, &len);
-    return ptr != NULL && memchr(ptr, 0, len) != NULL;
-}
-
-static inline const char *kafka_shim_msg_terminated(kafka_shim_msg *m, const char *ptr, size_t len) {
-    if (len + 1 > m->cap) {
-        char *grown = realloc(m->buf, len + 1);
-        if (grown == NULL) {
-            return "";
-        }
-        m->buf = grown;
-        m->cap = len + 1;
-    }
-    if (len > 0) {
-        memcpy(m->buf, ptr, len);
-    }
-    m->buf[len] = '\0';
-    return m->buf;
-}
-
-// A part holding no NUL. librdkafka's bytes are not NUL-terminated, and a
-// `string` return is read with strlen, so it goes through a terminated copy.
-static inline const char *kafka_shim_part_text(kafka_shim_msg *m, int part) {
-    const char *ptr;
-    size_t len;
-    kafka_shim_part(m, part, &ptr, &len);
-    return ptr == NULL ? "" : kafka_shim_msg_terminated(m, ptr, len);
-}
-
-// A part that does hold a NUL crosses a piece at a time, split at each NUL,
-// and Dex puts the NULs back between the pieces.
-static inline void kafka_shim_seg_begin(kafka_shim_msg *m, int part) {
-    const char *ptr;
-    size_t len;
-    kafka_shim_part(m, part, &ptr, &len);
-    m->seg = ptr;
-    m->seg_left = len;
-    m->seg_more = 1;
-}
-
-static inline bool kafka_shim_seg_more(kafka_shim_msg *m) {
-    return m->seg_more != 0;
-}
-
-static inline const char *kafka_shim_seg_next(kafka_shim_msg *m) {
-    const char *nul = m->seg_left > 0 ? memchr(m->seg, 0, m->seg_left) : NULL;
-    size_t n = nul ? (size_t)(nul - m->seg) : m->seg_left;
-    const char *out = kafka_shim_msg_terminated(m, m->seg, n);
-    if (nul != NULL) {
-        m->seg = nul + 1;
-        m->seg_left -= n + 1;
-    } else {
-        m->seg_left = 0;
-        m->seg_more = 0;
-    }
-    return out;
-}
-
-static inline char kafka_shim_nul(void) {
-    return '\0';
+    *n = ptr == NULL ? -1 : (long)len;
+    return ptr;
 }
 
 // ---- Administration ----

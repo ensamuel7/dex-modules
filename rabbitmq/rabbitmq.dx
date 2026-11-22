@@ -1,0 +1,1264 @@
+// rabbitmq: a RabbitMQ 4 client, over AMQP 1.0 with Qpid Proton.
+//
+// A Connection reconnects by itself, with backoff, and puts back what it had:
+// queues, exchanges and bindings declared through it, then its publishers and
+// consumers. A Publisher, Consumer and Connection each hold a C handle shared
+// by their copies and usable from any number of threads.
+
+import "str"
+
+external module pn {
+    include "rabbitmq_shim.h"
+    pkg "libqpid-proton-proactor"
+    pkg "libqpid-proton-core"
+
+    type PConn closed by "rmq_shim_conn_free"
+    type PLink closed by "rmq_shim_link_free"
+    type PDraft closed by "rmq_shim_draft_free"
+    type PIn closed by "rmq_shim_in_free"
+    type PReport closed by "rmq_shim_report_free"
+    type PReq closed by "rmq_shim_req_free"
+    type PReply closed by "rmq_shim_reply_free"
+
+    fn lastMessage(): string = "rmq_shim_last_message"
+
+    fn connNew(): PConn? = "rmq_shim_conn_new"
+    fn connEndpoint(
+        c: PConn,
+        host: string,
+        port: string,
+        user: string,
+        password: string,
+        vhost: string,
+        tls: bool
+    ): int =
+        "rmq_shim_conn_endpoint"
+    fn connSettings(
+        c: PConn,
+        container: string,
+        idleMs: int,
+        connectMs: int,
+        publishMs: int,
+        backoffMs: int,
+        backoffMaxMs: int,
+        maxAttempts: int,
+        resend: bool
+    ): void =
+        "rmq_shim_conn_settings"
+    fn connTls(c: PConn, caFile: string, verify: bool): void = "rmq_shim_conn_tls"
+    fn connStart(c: PConn): int = "rmq_shim_conn_start"
+    fn connClose(c: PConn): void = "rmq_shim_conn_close"
+    fn connState(c: PConn): int = "rmq_shim_conn_state"
+    fn connReconnects(c: PConn): long = "rmq_shim_conn_reconnects"
+    fn connContainer(c: PConn): string = "rmq_shim_conn_container"
+    fn connWaitOpen(c: PConn, timeoutMs: int): bool = "rmq_shim_conn_wait_open"
+    fn eventPeek(c: PConn): bool = "rmq_shim_event_peek"
+    fn eventTake(c: PConn): int = "rmq_shim_event_take"
+
+    fn publisherNew(c: PConn, address: string, window: int): PLink? = "rmq_shim_publisher_new"
+    fn consumerNew(c: PConn, address: string, window: int, offset: string, timestamp: long): PLink? =
+        "rmq_shim_consumer_new"
+    fn linkClose(l: PLink): void = "rmq_shim_link_close"
+    fn linkFailure(l: PLink): string = "rmq_shim_link_failure"
+
+    fn draftNew(body: string, size: int): PDraft? = "rmq_shim_draft_new"
+    fn draftText(d: PDraft, field: int, value: string): void = "rmq_shim_draft_text"
+    fn draftNumbers(d: PDraft, durable: bool, priority: int, ttl: long, created: long): void = "rmq_shim_draft_numbers"
+    fn draftProp(d: PDraft, key: string, value: string, size: int): void = "rmq_shim_draft_prop"
+    fn publish(l: PLink, d: PDraft, mode: int, tag: long, outcome: &int): int = "rmq_shim_publish"
+    fn sendBody(l: PLink, body: string, size: int): int = "rmq_shim_send_body"
+    fn reportNext(l: PLink, timeoutMs: int): PReport? = "rmq_shim_report_next"
+    fn reportTag(r: PReport): long = "rmq_shim_report_tag"
+    fn reportOutcome(r: PReport): int = "rmq_shim_report_outcome"
+    fn reportReason(r: PReport): string = "rmq_shim_report_reason"
+    fn flush(l: PLink, timeoutMs: int): int = "rmq_shim_flush"
+    fn inFlight(l: PLink): int = "rmq_shim_in_flight"
+    fn count(l: PLink, which: int): long = "rmq_shim_count"
+
+    fn receive(l: PLink, timeoutMs: int): PIn? = "rmq_shim_receive"
+    fn consumerDone(l: PLink): bool = "rmq_shim_consumer_done"
+    fn pause(l: PLink, paused: bool): void = "rmq_shim_pause"
+    fn settle(m: PIn, how: int): int = "rmq_shim_settle"
+    fn decode(m: PIn): int = "rmq_shim_in_decode"
+    fn body(m: PIn, n: &long): string sized by n = "rmq_shim_in_body"
+    fn text(m: PIn, field: int): string = "rmq_shim_in_text"
+    fn number(m: PIn, field: int): long = "rmq_shim_in_number"
+    fn propCount(m: PIn): int = "rmq_shim_in_prop_count"
+    fn propKey(m: PIn, i: int, n: &long): string sized by n = "rmq_shim_in_prop_key"
+    fn propValue(m: PIn, i: int, n: &long): string sized by n = "rmq_shim_in_prop_value"
+    fn annotation(m: PIn, key: string, n: &long): string sized by n = "rmq_shim_in_annotation"
+
+    fn reqNew(method: string, path: string): PReq? = "rmq_shim_req_new"
+    fn reqMap(r: PReq): void = "rmq_shim_req_map"
+    fn reqEnd(r: PReq): void = "rmq_shim_req_end"
+    fn reqKey(r: PReq, key: string): void = "rmq_shim_req_key"
+    fn reqString(r: PReq, key: string, value: string): void = "rmq_shim_req_string"
+    fn reqBool(r: PReq, key: string, value: bool): void = "rmq_shim_req_bool"
+    fn reqLong(r: PReq, key: string, value: long): void = "rmq_shim_req_long"
+    fn reqRecord(r: PReq, mode: int): void = "rmq_shim_req_record"
+    fn reqForget(r: PReq, path: string): void = "rmq_shim_req_forget"
+    fn reqSend(c: PConn, r: PReq): PReply? = "rmq_shim_req_send"
+    fn replyStatus(r: PReply): int = "rmq_shim_reply_status"
+    fn replyText(r: PReply, key: string, n: &long): string sized by n = "rmq_shim_reply_text"
+    fn replyLong(r: PReply, key: string): long = "rmq_shim_reply_long"
+    fn encodeSegment(s: string): owned string = "rmq_shim_encode_segment"
+    fn unescape(s: string): owned string = "rmq_shim_unescape"
+}
+
+// Error codes. Those from 400 up are the management API's own statuses.
+const ERR_CLOSED: int = -1
+const ERR_TIMEOUT: int = -2
+const ERR_CONNECT: int = -3
+const ERR_AUTH: int = -4
+const ERR_LINK: int = -5
+const ERR_INVALID: int = -7
+const ERR_UNKNOWN_OUTCOME: int = -8
+const ERR_BAD_REQUEST: int = 400
+const ERR_FORBIDDEN: int = 403
+const ERR_NOT_FOUND: int = 404
+const ERR_PRECONDITION: int = 409
+
+const STATE_CONNECTING: int = 0
+const STATE_OPEN: int = 1
+const STATE_RECONNECTING: int = 2
+const STATE_CLOSED: int = 3
+
+// What the broker did with a message.
+// Accepted: it has it. Released: no queue took it, from an exchange with no
+// matching binding, say; sending it again will do the same unless that changes.
+// Rejected: refused, for a reason given. Modified: like released, but marked.
+// Failed: it never got an answer, so it may or may not have arrived.
+const ACCEPTED: int = 0
+const RELEASED: int = 1
+const REJECTED: int = 2
+const MODIFIED: int = 3
+const FAILED: int = 4
+
+const EVENT_OPEN: int = 0
+const EVENT_DOWN: int = 1
+const EVENT_RECOVERY: int = 2
+const EVENT_LINK: int = 3
+const EVENT_FAILED: int = 4
+
+const DEFAULT_TIMEOUT_MS: int = 30000
+
+// Measured on RabbitMQ 4.1: a window of 2000 publishes as fast as 5000, and a
+// credit of 1000 consumes steadily where 256 varies by half from run to run.
+const DEFAULT_WINDOW: int = 2000
+const DEFAULT_CREDIT: int = 1000
+
+const SETTLE_ACCEPT: int = 0
+const SETTLE_REQUEUE: int = 1
+const SETTLE_DISCARD: int = 2
+const SETTLE_FAILED: int = 3
+
+const FIELD_SUBJECT: int = 0
+const FIELD_CONTENT_TYPE: int = 1
+const FIELD_REPLY_TO: int = 2
+const FIELD_TO: int = 3
+const FIELD_MESSAGE_ID: int = 4
+const FIELD_CORRELATION_ID: int = 5
+const FIELD_CONTENT_ENCODING: int = 6
+const FIELD_GROUP_ID: int = 7
+
+const RECORD: int = 1
+const FORGET: int = 2
+
+// message: what went wrong. code: one of the ERR_ constants, or the management
+// API's status for a declaration it refused.
+struct RabbitError(message: string, code: int) {}
+
+// How to connect. Make one with options(uri), change what you need, and pass it
+// to connectWith. More than one uri is a cluster: a reconnect tries the next.
+struct Options {
+    uris: string[]
+    containerId: string
+    caFile: string
+    idleTimeoutMs: int
+    connectTimeoutMs: int
+    publishTimeoutMs: int
+    backoffMs: int
+    backoffMaxMs: int
+    maxReconnectAttempts: int
+    resendInFlight: bool
+    verifyPeer: bool
+}
+
+// Where a publisher sends: a queue, an exchange and routing key, or anywhere,
+// each message naming its own with withTo.
+struct Target {
+    address: string
+}
+
+// A message to send, or one received. The fields after properties are set on
+// the way in: the exchange and routing key it was published with, how many
+// times it has been delivered before, and whether this is not the first time.
+struct Message {
+    body: string
+    subject: string
+    contentType: string
+    contentEncoding: string
+    messageId: string
+    correlationId: string
+    replyTo: string
+    to: string
+    groupId: string
+    properties: map[string, string]
+    exchange: string
+    routingKey: string
+    ttlMs: long
+    createdAt: long
+    deliveryCount: long
+    priority: int
+    durable: bool
+    redelivered: bool
+
+    fn withSubject(v: string): Message {
+        let n: Message = self.clone()
+        n.subject = v
+        return n
+    }
+
+    fn withContentType(v: string): Message {
+        let n: Message = self.clone()
+        n.contentType = v
+        return n
+    }
+
+    fn withMessageId(v: string): Message {
+        let n: Message = self.clone()
+        n.messageId = v
+        return n
+    }
+
+    fn withCorrelationId(v: string): Message {
+        let n: Message = self.clone()
+        n.correlationId = v
+        return n
+    }
+
+    fn withReplyTo(v: string): Message {
+        let n: Message = self.clone()
+        n.replyTo = v
+        return n
+    }
+
+    // Where a publisher made with anywhere() sends it: an address from
+    // toQueue or toExchange.
+    fn withTo(t: Target): Message {
+        let n: Message = self.clone()
+        n.to = t.address
+        return n
+    }
+
+    // An application property. Copies the properties, so the original keeps its own.
+    fn withProperty(key: string, value: string): Message {
+        let props: map[string, string] = {}
+        foreach (self.properties.keys() as k) {
+            props.set(k, self.properties[k])
+        }
+
+        props.set(key, value)
+        let n: Message = self.clone()
+        n.properties = props
+        return n
+    }
+
+    fn withPriority(p: int): Message {
+        let n: Message = self.clone()
+        n.priority = p
+        return n
+    }
+
+    fn withTtl(ms: long): Message {
+        let n: Message = self.clone()
+        n.ttlMs = ms
+        return n
+    }
+
+    // Durable messages survive a broker restart, in a durable queue. The default.
+    fn withDurable(d: bool): Message {
+        let n: Message = self.clone()
+        n.durable = d
+        return n
+    }
+
+    fn property(key: string): string {
+        if (self.properties.has(key)) {
+            return self.properties[key]
+        }
+
+        return ""
+    }
+
+    private fn clone(): Message {
+        return Message {
+            body: self.body,
+            subject: self.subject,
+            contentType: self.contentType,
+            contentEncoding: self.contentEncoding,
+            messageId: self.messageId,
+            correlationId: self.correlationId,
+            replyTo: self.replyTo,
+            to: self.to,
+            groupId: self.groupId,
+            properties: self.properties,
+            ttlMs: self.ttlMs,
+            createdAt: self.createdAt,
+            priority: self.priority,
+            durable: self.durable,
+            exchange: self.exchange,
+            routingKey: self.routingKey,
+            deliveryCount: self.deliveryCount,
+            redelivered: self.redelivered
+        }
+    }
+}
+
+struct Outcome {
+    reason: string
+    tag: long
+    state: int
+
+    fn accepted(): bool {
+        return self.state == ACCEPTED
+    }
+}
+
+struct ConnectionEvent {
+    message: string
+    kind: int
+}
+
+struct QueueInfo {
+    name: string
+    kind: string
+    leader: string
+    messages: long
+    consumers: long
+    durable: bool
+    exclusive: bool
+    autoDelete: bool
+}
+
+// A queue to declare. Make one with quorumQueue, classicQueue or streamQueue.
+struct QueueSpec {
+    name: string
+    kind: string
+    textArgs: map[string, string]
+    longArgs: map[string, long]
+    boolArgs: map[string, bool]
+    exclusive: bool
+    autoDelete: bool
+
+    fn withArg(key: string, value: string): QueueSpec {
+        let n: QueueSpec = self.clone()
+        n.textArgs = copyText(self.textArgs)
+        n.textArgs.set(key, value)
+        return n
+    }
+
+    fn withLongArg(key: string, value: long): QueueSpec {
+        let n: QueueSpec = self.clone()
+        n.longArgs = copyLong(self.longArgs)
+        n.longArgs.set(key, value)
+        return n
+    }
+
+    fn withBoolArg(key: string, value: bool): QueueSpec {
+        let n: QueueSpec = self.clone()
+        n.boolArgs = copyBool(self.boolArgs)
+        n.boolArgs.set(key, value)
+        return n
+    }
+
+    // Rejected and expired messages go to this exchange, with this routing key
+    // ("" keeps theirs).
+    fn deadLetter(exchange: string, routingKey: string): QueueSpec {
+        let n: QueueSpec = self.withArg("x-dead-letter-exchange", exchange)
+        if (routingKey.isEmpty()) {
+            return n
+        }
+
+        return n.withArg("x-dead-letter-routing-key", routingKey)
+    }
+
+    fn messageTtl(ms: long): QueueSpec {
+        return self.withLongArg("x-message-ttl", ms)
+    }
+
+    fn maxLength(messages: long): QueueSpec {
+        return self.withLongArg("x-max-length", messages)
+    }
+
+    fn maxLengthBytes(bytes: long): QueueSpec {
+        return self.withLongArg("x-max-length-bytes", bytes)
+    }
+
+    // Quorum queues: deliveries before a message is dead-lettered or dropped.
+    fn deliveryLimit(n: long): QueueSpec {
+        return self.withLongArg("x-delivery-limit", n)
+    }
+
+    fn singleActiveConsumer(): QueueSpec {
+        return self.withBoolArg("x-single-active-consumer", true)
+    }
+
+    // Streams: how long to keep messages, as "7D", "12h", "30m" or "60s".
+    fn maxAge(age: string): QueueSpec {
+        return self.withArg("x-max-age", age)
+    }
+
+    // Classic queues only: deleted when this connection closes.
+    fn exclusiveToConnection(): QueueSpec {
+        let n: QueueSpec = self.clone()
+        n.exclusive = true
+        return n
+    }
+
+    // Classic queues only: deleted when its last consumer goes.
+    fn deleteWhenUnused(): QueueSpec {
+        let n: QueueSpec = self.clone()
+        n.autoDelete = true
+        return n
+    }
+
+    private fn clone(): QueueSpec {
+        return QueueSpec {
+            name: self.name,
+            kind: self.kind,
+            textArgs: self.textArgs,
+            longArgs: self.longArgs,
+            boolArgs: self.boolArgs,
+            exclusive: self.exclusive,
+            autoDelete: self.autoDelete
+        }
+    }
+}
+
+// A stream consumer's starting point.
+struct StreamOffset {
+    spec: string
+    timestamp: long
+}
+
+// ---- Publisher ----
+
+struct Publisher {
+    private h: PConn
+    private l: PLink
+
+    // Sends and waits for the broker's answer. Many threads can do this at
+    // once; their messages share the link. Throws with ERR_UNKNOWN_OUTCOME if no
+    // answer came within the publish timeout: the broker may have it.
+    fn publish(m: Message): Outcome throws RabbitError {
+        let d: PDraft = draftOf(m)
+        let state: int = 0
+        check(pn.publish(self.l, d, 2, 0, state))
+        return Outcome { reason: pn.lastMessage(), tag: 0, state: state }
+    }
+
+    // Sends without waiting. While the window is full this waits for room,
+    // which is the backpressure that keeps a fast publisher from flooding the
+    // broker. Outcomes are counted; see accepted, failed and the events.
+    fn send(m: Message): void throws RabbitError {
+        if (isPlain(m)) {
+            check(pn.sendBody(self.l, m.body, m.body.len()))
+            return
+        }
+
+        let d: PDraft = draftOf(m)
+        let state: int = 0
+        check(pn.publish(self.l, d, 0, 0, state))
+    }
+
+    // Sends a body and nothing else, as durable. The fastest way to publish.
+    fn sendBody(body: string): void throws RabbitError {
+        check(pn.sendBody(self.l, body, body.len()))
+    }
+
+    // Sends without waiting, and reports the outcome under tag through
+    // nextOutcome. Read the reports: they wait until read.
+    fn sendTracked(m: Message, tag: long): void throws RabbitError {
+        let d: PDraft = draftOf(m)
+        let state: int = 0
+        check(pn.publish(self.l, d, 1, tag, state))
+    }
+
+    fn nextOutcome(timeoutMs: int): Outcome? {
+        let r: PReport? = pn.reportNext(self.l, timeoutMs)
+        if (r == null) {
+            return null
+        }
+
+        return Outcome { reason: pn.reportReason(r), tag: pn.reportTag(r), state: pn.reportOutcome(r) }
+    }
+
+    // Waits for every message in flight to be answered. Returns how many are not.
+    fn flush(timeoutMs: int = DEFAULT_TIMEOUT_MS): int {
+        return pn.flush(self.l, timeoutMs)
+    }
+
+    fn inFlight(): int {
+        return pn.inFlight(self.l)
+    }
+
+    fn accepted(): long {
+        return pn.count(self.l, 0)
+    }
+
+    // Released or modified: no queue took them.
+    fn released(): long {
+        return pn.count(self.l, 1)
+    }
+
+    fn rejected(): long {
+        return pn.count(self.l, 2)
+    }
+
+    // Timed out, or lost with a connection while resending is off.
+    fn failed(): long {
+        return pn.count(self.l, 3)
+    }
+
+    // Why the broker detached this publisher, or "".
+    fn failure(): string {
+        return pn.linkFailure(self.l)
+    }
+
+    // Flushes for up to timeoutMs, then closes. Returns how many messages were
+    // still unanswered; they fail.
+    fn close(timeoutMs: int = DEFAULT_TIMEOUT_MS): int {
+        let left: int = pn.flush(self.l, timeoutMs)
+        pn.linkClose(self.l)
+        return left
+    }
+}
+
+// A received message, and the means to settle it. Each settles once; a second
+// call, or one after the connection it came on was lost, returns false, and in
+// that case the broker delivers the message again.
+struct Delivery {
+    message: Message
+    private m: PIn
+
+    // Done with: the broker forgets it.
+    fn accept(): bool {
+        return pn.settle(self.m, SETTLE_ACCEPT) == 0
+    }
+
+    // Not handled: back to the queue, for this or another consumer.
+    fn requeue(): bool {
+        return pn.settle(self.m, SETTLE_REQUEUE) == 0
+    }
+
+    // Never to be handled: dead-lettered if the queue says so, else dropped.
+    fn discard(): bool {
+        return pn.settle(self.m, SETTLE_DISCARD) == 0
+    }
+
+    // Failed this time: requeued, and counted toward a quorum queue's delivery
+    // limit, so that a message that always fails ends up dead-lettered.
+    fn fail(): bool {
+        return pn.settle(self.m, SETTLE_FAILED) == 0
+    }
+}
+
+// ---- Consumer ----
+
+struct Consumer {
+    private h: PConn
+    private l: PLink
+
+    // The next message, or null after timeoutMs. Settle it with accept, requeue,
+    // discard or fail; one let go of unsettled is requeued. Throws when the
+    // consumer can deliver nothing more: closed, its queue deleted, or the
+    // connection closed for good. Across a reconnect it waits, then carries on.
+    fn receive(timeoutMs: int): Delivery? throws RabbitError {
+        let m: PIn? = pn.receive(self.l, timeoutMs)
+        if (m == null) {
+            if (pn.consumerDone(self.l)) {
+                let why: string = pn.linkFailure(self.l)
+                if (why.isEmpty()) {
+                    throw RabbitError("the consumer is closed", ERR_CLOSED)
+                }
+
+                throw RabbitError("the broker detached the consumer: " + why, ERR_LINK)
+            }
+
+            return null
+        }
+
+        return deliveryOf(m)
+    }
+
+    // Stop taking new messages, without leaving the queue. Those already sent
+    // still arrive.
+    fn pause(): void {
+        pn.pause(self.l, true)
+    }
+
+    fn resume(): void {
+        pn.pause(self.l, false)
+    }
+
+    // Why the broker detached this consumer, or "".
+    fn failure(): string {
+        return pn.linkFailure(self.l)
+    }
+
+    // Stops. Messages received and not yet settled go back to the queue.
+    fn close(): void {
+        pn.linkClose(self.l)
+    }
+}
+
+// ---- Connection ----
+
+struct Connection {
+    private h: PConn
+
+    // A publisher to a target. window is how many messages may be in flight at
+    // once, unanswered: the more, the faster, up to what the broker allows.
+    fn publisher(t: Target, window: int = DEFAULT_WINDOW): Publisher throws RabbitError {
+        let l: PLink? = pn.publisherNew(self.h, t.address, window)
+        if (l == null) {
+            throw RabbitError(pn.lastMessage(), ERR_CLOSED)
+        }
+
+        return Publisher { h: self.h, l: l }
+    }
+
+    // A consumer of a queue. credit is how many messages it holds ready ahead
+    // of receive: the more, the faster, and the more redelivered if it crashes.
+    fn consumer(queue: string, credit: int = DEFAULT_CREDIT): Consumer throws RabbitError {
+        return self.openConsumer(queuePath(queue), credit, "", 0)
+    }
+
+    // A consumer of a stream queue, starting at an offset.
+    fn streamConsumer(queue: string, from: StreamOffset, credit: int = DEFAULT_CREDIT): Consumer throws RabbitError {
+        return self.openConsumer(queuePath(queue), credit, from.spec, from.timestamp)
+    }
+
+    private fn openConsumer(
+        address: string,
+        credit: int,
+        offset: string,
+        timestamp: long
+    ): Consumer throws RabbitError {
+        let l: PLink? = pn.consumerNew(self.h, address, credit, offset, timestamp)
+        if (l == null) {
+            throw RabbitError(pn.lastMessage(), ERR_CLOSED)
+        }
+
+        return Consumer { h: self.h, l: l }
+    }
+
+    // Declares a queue, or checks one already there matches. Throws with
+    // ERR_PRECONDITION if it exists with other settings. Recorded, so that it is
+    // declared again after a reconnect.
+    fn declareQueue(spec: QueueSpec): QueueInfo throws RabbitError {
+        let path: string = queuePath(spec.name)
+        let r: PReq? = pn.reqNew("PUT", path)
+        if (r == null) {
+            throw RabbitError(pn.lastMessage(), ERR_INVALID)
+        }
+
+        pn.reqMap(r)
+        pn.reqBool(r, "durable", true)
+        pn.reqBool(r, "exclusive", spec.exclusive)
+        pn.reqBool(r, "auto_delete", spec.autoDelete)
+        pn.reqKey(r, "arguments")
+        pn.reqMap(r)
+        if (!spec.kind.isEmpty()) {
+            pn.reqString(r, "x-queue-type", spec.kind)
+        }
+
+        foreach (spec.textArgs.keys() as k) {
+            pn.reqString(r, k, spec.textArgs[k])
+        }
+
+        foreach (spec.longArgs.keys() as k) {
+            pn.reqLong(r, k, spec.longArgs[k])
+        }
+
+        foreach (spec.boolArgs.keys() as k) {
+            pn.reqBool(r, k, spec.boolArgs[k])
+        }
+
+        pn.reqEnd(r)
+        pn.reqEnd(r)
+        pn.reqRecord(r, RECORD)
+        return infoOf(spec.name, expect(self.h, r, 200, 201, "declaring queue " + spec.name))
+    }
+
+    // A queue's settings and counts. Throws with ERR_NOT_FOUND if there is none.
+    fn queue(name: string): QueueInfo throws RabbitError {
+        let r: PReq? = pn.reqNew("GET", queuePath(name))
+        if (r == null) {
+            throw RabbitError(pn.lastMessage(), ERR_INVALID)
+        }
+
+        return infoOf(name, expect(self.h, r, 200, 200, "reading queue " + name))
+    }
+
+    // Deletes a queue, and its messages. A queue already gone is not an error.
+    fn deleteQueue(name: string): void throws RabbitError {
+        let path: string = queuePath(name)
+        let r: PReq? = pn.reqNew("DELETE", path)
+        if (r == null) {
+            throw RabbitError(pn.lastMessage(), ERR_INVALID)
+        }
+
+        pn.reqForget(r, path)
+        expectGone(self.h, r, "deleting queue " + name)
+    }
+
+    // Removes every ready message from a queue. Returns how many.
+    fn purgeQueue(name: string): long throws RabbitError {
+        let r: PReq? = pn.reqNew("DELETE", queuePath(name) + "/messages")
+        if (r == null) {
+            throw RabbitError(pn.lastMessage(), ERR_INVALID)
+        }
+
+        let reply: PReply = expect(self.h, r, 200, 200, "purging queue " + name)
+        return pn.replyLong(reply, "message_count")
+    }
+
+    // An exchange: kind is "direct", "topic", "fanout" or "headers". Recorded,
+    // like a queue.
+    fn declareExchange(name: string, kind: string = "direct", autoDelete: bool = false): void throws RabbitError {
+        let path: string = exchangePath(name)
+        let r: PReq? = pn.reqNew("PUT", path)
+        if (r == null) {
+            throw RabbitError(pn.lastMessage(), ERR_INVALID)
+        }
+
+        pn.reqMap(r)
+        pn.reqString(r, "type", kind)
+        pn.reqBool(r, "durable", true)
+        pn.reqBool(r, "auto_delete", autoDelete)
+        pn.reqBool(r, "internal", false)
+        pn.reqKey(r, "arguments")
+        pn.reqMap(r)
+        pn.reqEnd(r)
+        pn.reqEnd(r)
+        pn.reqRecord(r, RECORD)
+        expect(self.h, r, 201, 204, "declaring exchange " + name)
+    }
+
+    fn deleteExchange(name: string): void throws RabbitError {
+        let path: string = exchangePath(name)
+        let r: PReq? = pn.reqNew("DELETE", path)
+        if (r == null) {
+            throw RabbitError(pn.lastMessage(), ERR_INVALID)
+        }
+
+        pn.reqForget(r, path)
+        expectGone(self.h, r, "deleting exchange " + name)
+    }
+
+    // Messages published to exchange with a matching routing key reach queue.
+    fn bind(exchange: string, queue: string, key: string): void throws RabbitError {
+        self.addBinding(exchange, "destination_queue", "dstq", queue, key)
+    }
+
+    fn unbind(exchange: string, queue: string, key: string): void throws RabbitError {
+        self.removeBinding(exchange, "dstq", queue, key)
+    }
+
+    fn bindExchange(source: string, destination: string, key: string): void throws RabbitError {
+        self.addBinding(source, "destination_exchange", "dste", destination, key)
+    }
+
+    fn unbindExchange(source: string, destination: string, key: string): void throws RabbitError {
+        self.removeBinding(source, "dste", destination, key)
+    }
+
+    private fn addBinding(
+        source: string,
+        field: string,
+        kind: string,
+        destination: string,
+        key: string
+    ): void throws RabbitError {
+        let r: PReq? = pn.reqNew("POST", "/bindings")
+        if (r == null) {
+            throw RabbitError(pn.lastMessage(), ERR_INVALID)
+        }
+
+        pn.reqMap(r)
+        pn.reqString(r, "source", source)
+        pn.reqString(r, field, destination)
+        pn.reqString(r, "binding_key", key)
+        pn.reqKey(r, "arguments")
+        pn.reqMap(r)
+        pn.reqEnd(r)
+        pn.reqEnd(r)
+        // Recorded under the path that deletes it, so unbinding forgets it.
+        pn.reqForget(r, bindingPath(source, kind, destination, key))
+        pn.reqRecord(r, RECORD)
+        expect(self.h, r, 201, 204, "binding " + source + " to " + destination)
+    }
+
+    private fn removeBinding(source: string, kind: string, destination: string, key: string): void throws RabbitError {
+        let path: string = bindingPath(source, kind, destination, key)
+        let r: PReq? = pn.reqNew("DELETE", path)
+        if (r == null) {
+            throw RabbitError(pn.lastMessage(), ERR_INVALID)
+        }
+
+        pn.reqForget(r, path)
+        expectGone(self.h, r, "unbinding " + source + " from " + destination)
+    }
+
+    // STATE_OPEN, STATE_RECONNECTING, STATE_CONNECTING or STATE_CLOSED.
+    fn state(): int {
+        return pn.connState(self.h)
+    }
+
+    fn isOpen(): bool {
+        return pn.connState(self.h) == STATE_OPEN
+    }
+
+    // Waits up to timeoutMs for the connection to be open, as after an outage.
+    fn waitOpen(timeoutMs: int): bool {
+        return pn.connWaitOpen(self.h, timeoutMs)
+    }
+
+    // How many times it has reconnected.
+    fn reconnects(): long {
+        return pn.connReconnects(self.h)
+    }
+
+    fn containerId(): string {
+        return pn.connContainer(self.h)
+    }
+
+    // What has happened since last asked, oldest first: connected, lost,
+    // recovery problems, links the broker closed, messages that failed.
+    fn events(): ConnectionEvent[] {
+        let out: ConnectionEvent[] = []
+        while (pn.eventPeek(self.h)) {
+            let kind: int = pn.eventTake(self.h)
+            out.push(ConnectionEvent { message: pn.lastMessage(), kind: kind })
+        }
+
+        return out
+    }
+
+    // Closes for good. Publishers and consumers on it stop. Letting the last
+    // reference to the connection and everything made from it go does the same.
+    fn close(): void {
+        pn.connClose(self.h)
+    }
+}
+
+// ---- Making them ----
+
+// Connects to amqp://user:password@host:port/vhost (amqps:// for TLS), with the
+// defaults options describes.
+fn connect(uri: string): Connection throws RabbitError {
+    return connectWith(options(uri))
+}
+
+// Reconnects forever, starting after 500 ms and doubling to 30 s, with jitter.
+// Messages in flight when a connection drops are sent again, so a consumer may
+// see one twice. A publish waits up to 30 s, across outages, for an answer.
+fn options(uri: string): Options {
+    let uris: string[] = [uri]
+    return Options {
+        uris: uris,
+        containerId: "",
+        caFile: "",
+        idleTimeoutMs: 30000,
+        connectTimeoutMs: 30000,
+        publishTimeoutMs: DEFAULT_TIMEOUT_MS,
+        backoffMs: 500,
+        backoffMaxMs: 30000,
+        maxReconnectAttempts: 0,
+        resendInFlight: true,
+        verifyPeer: true
+    }
+}
+
+fn connectWith(o: Options): Connection throws RabbitError {
+    if (o.uris.len() == 0) {
+        throw RabbitError("no uri to connect to", ERR_INVALID)
+    }
+
+    let c: PConn? = pn.connNew()
+    if (c == null) {
+        throw RabbitError("out of memory", ERR_INVALID)
+    }
+
+    foreach (o.uris as uri) {
+        addEndpoint(c, uri)
+    }
+
+    pn.connSettings(
+        c,
+        o.containerId,
+        o.idleTimeoutMs,
+        o.connectTimeoutMs,
+        o.publishTimeoutMs,
+        o.backoffMs,
+        o.backoffMaxMs,
+        o.maxReconnectAttempts,
+        o.resendInFlight
+    )
+    pn.connTls(c, o.caFile, o.verifyPeer)
+    check(pn.connStart(c))
+    return Connection { h: c }
+}
+
+fn toQueue(name: string): Target {
+    return Target { address: queuePath(name) }
+}
+
+// An exchange, and the routing key every message gets. A key of "" sends with none.
+fn toExchange(exchange: string, key: string = ""): Target {
+    if (key.isEmpty()) {
+        return Target { address: exchangePath(exchange) }
+    }
+
+    return Target { address: exchangePath(exchange) + "/" + pn.encodeSegment(key) }
+}
+
+// A publisher whose messages each name their target with withTo.
+fn anywhere(): Target {
+    return Target { address: "" }
+}
+
+fn message(body: string): Message {
+    let props: map[string, string] = {}
+    return Message {
+        body: body,
+        subject: "",
+        contentType: "",
+        contentEncoding: "",
+        messageId: "",
+        correlationId: "",
+        replyTo: "",
+        to: "",
+        groupId: "",
+        properties: props,
+        ttlMs: 0,
+        createdAt: 0,
+        priority: -1,
+        durable: true,
+        exchange: "",
+        routingKey: "",
+        deliveryCount: 0,
+        redelivered: false
+    }
+}
+
+// Replicated across the cluster, and the right choice for most queues.
+fn quorumQueue(name: string): QueueSpec {
+    return spec(name, "quorum")
+}
+
+fn classicQueue(name: string): QueueSpec {
+    return spec(name, "classic")
+}
+
+// An append-only log, read from any offset by streamConsumer.
+fn streamQueue(name: string): QueueSpec {
+    return spec(name, "stream")
+}
+
+fn fromFirst(): StreamOffset {
+    return StreamOffset { spec: "first", timestamp: 0 }
+}
+
+fn fromLast(): StreamOffset {
+    return StreamOffset { spec: "last", timestamp: 0 }
+}
+
+// Only messages that arrive from now on.
+fn fromNext(): StreamOffset {
+    return StreamOffset { spec: "next", timestamp: 0 }
+}
+
+fn fromOffset(offset: long): StreamOffset {
+    return StreamOffset { spec: str.fromLong(offset), timestamp: 0 }
+}
+
+// From the first message stored at or after this time, in milliseconds since the epoch.
+fn fromTime(ms: long): StreamOffset {
+    return StreamOffset { spec: "", timestamp: ms }
+}
+
+// ---- Helpers ----
+
+private fn check(rc: int): void throws RabbitError {
+    if (rc != 0) {
+        raise(rc)
+    }
+}
+
+private fn raise(code: int): void throws RabbitError {
+    throw RabbitError(pn.lastMessage(), code)
+}
+
+private fn spec(name: string, kind: string): QueueSpec {
+    let t: map[string, string] = {}
+    let l: map[string, long] = {}
+    let b: map[string, bool] = {}
+    return QueueSpec {
+        name: name,
+        kind: kind,
+        textArgs: t,
+        longArgs: l,
+        boolArgs: b,
+        exclusive: false,
+        autoDelete: false
+    }
+}
+
+private fn copyText(m: map[string, string]): map[string, string] {
+    let out: map[string, string] = {}
+    foreach (m.keys() as k) {
+        out.set(k, m[k])
+    }
+
+    return out
+}
+
+private fn copyLong(m: map[string, long]): map[string, long] {
+    let out: map[string, long] = {}
+    foreach (m.keys() as k) {
+        out.set(k, m[k])
+    }
+
+    return out
+}
+
+private fn copyBool(m: map[string, bool]): map[string, bool] {
+    let out: map[string, bool] = {}
+    foreach (m.keys() as k) {
+        out.set(k, m[k])
+    }
+
+    return out
+}
+
+private fn queuePath(name: string): string {
+    return "/queues/" + pn.encodeSegment(name)
+}
+
+private fn exchangePath(name: string): string {
+    return "/exchanges/" + pn.encodeSegment(name)
+}
+
+private fn bindingPath(source: string, kind: string, destination: string, key: string): string {
+    return "/bindings/src=" +
+        pn.encodeSegment(source) +
+        ";" +
+        kind +
+        "=" +
+        pn.encodeSegment(destination) +
+        ";key=" +
+        pn.encodeSegment(key) +
+        ";args="
+}
+
+// Sends a request, and throws unless its status is one of the two expected.
+private fn expect(h: PConn, r: PReq, a: int, b: int, what: string): PReply throws RabbitError {
+    let reply: PReply? = pn.reqSend(h, r)
+    if (reply == null) {
+        throw RabbitError(what + ": " + pn.lastMessage(), ERR_TIMEOUT)
+    }
+
+    let status: int = pn.replyStatus(reply)
+    if (status != a && status != b && status != 204) {
+        throw RabbitError(what + ": " + describe(status), status)
+    }
+
+    return reply
+}
+
+// As expect, for a deletion: gone already is as good as gone now.
+private fn expectGone(h: PConn, r: PReq, what: string): void throws RabbitError {
+    let reply: PReply? = pn.reqSend(h, r)
+    if (reply == null) {
+        throw RabbitError(what + ": " + pn.lastMessage(), ERR_TIMEOUT)
+    }
+
+    let status: int = pn.replyStatus(reply)
+    if (status != 200 && status != 204 && status != ERR_NOT_FOUND) {
+        throw RabbitError(what + ": " + describe(status), status)
+    }
+}
+
+private fn describe(status: int): string {
+    if (status == ERR_PRECONDITION) {
+        return "it already exists with other settings (409)"
+    }
+
+    if (status == ERR_NOT_FOUND) {
+        return "not found (404)"
+    }
+
+    if (status == ERR_FORBIDDEN) {
+        return "not allowed (403)"
+    }
+
+    if (status == ERR_BAD_REQUEST) {
+        return "the broker refused it as invalid (400)"
+    }
+
+    return "the broker answered " + str.fromInt(status)
+}
+
+private fn infoOf(name: string, r: PReply): QueueInfo {
+    let n: long = 0
+    let kind: string = pn.replyText(r, "type", n)
+    let leader: string = pn.replyText(r, "leader", n)
+    return QueueInfo {
+        name: name,
+        kind: kind,
+        leader: leader,
+        messages: pn.replyLong(r, "message_count"),
+        consumers: pn.replyLong(r, "consumer_count"),
+        durable: pn.replyText(r, "durable", n) == "true",
+        exclusive: pn.replyText(r, "exclusive", n) == "true",
+        autoDelete: pn.replyText(r, "auto_delete", n) == "true"
+    }
+}
+
+private fn isPlain(m: Message): bool {
+    return m.durable &&
+        m.subject.isEmpty() &&
+        m.contentType.isEmpty() &&
+        m.messageId.isEmpty() &&
+        m.correlationId.isEmpty() &&
+        m.replyTo.isEmpty() &&
+        m.to.isEmpty() &&
+        m.groupId.isEmpty() &&
+        m.contentEncoding.isEmpty() &&
+        m.priority < 0 &&
+        m.ttlMs == 0 &&
+        m.createdAt == 0 &&
+        m.properties.len() == 0
+}
+
+private fn draftOf(m: Message): PDraft throws RabbitError {
+    let d: PDraft? = pn.draftNew(m.body, m.body.len())
+    if (d == null) {
+        throw RabbitError("out of memory", ERR_INVALID)
+    }
+
+    setText(d, FIELD_SUBJECT, m.subject)
+    setText(d, FIELD_CONTENT_TYPE, m.contentType)
+    setText(d, FIELD_CONTENT_ENCODING, m.contentEncoding)
+    setText(d, FIELD_MESSAGE_ID, m.messageId)
+    setText(d, FIELD_CORRELATION_ID, m.correlationId)
+    setText(d, FIELD_REPLY_TO, m.replyTo)
+    setText(d, FIELD_TO, m.to)
+    setText(d, FIELD_GROUP_ID, m.groupId)
+    pn.draftNumbers(d, m.durable, m.priority, m.ttlMs, m.createdAt)
+    foreach (m.properties.keys() as k) {
+        let v: string = m.properties[k]
+        pn.draftProp(d, k, v, v.len())
+    }
+
+    return d
+}
+
+private fn setText(d: PDraft, field: int, value: string): void {
+    if (!value.isEmpty()) {
+        pn.draftText(d, field, value)
+    }
+}
+
+private fn deliveryOf(m: PIn): Delivery throws RabbitError {
+    check(pn.decode(m))
+    let n: long = 0
+    let props: map[string, string] = {}
+    let count: int = pn.propCount(m)
+    for (let i: int = 0; i < count; i++) {
+        let key: string = pn.propKey(m, i, n)
+        props.set(key, pn.propValue(m, i, n))
+    }
+
+    let msg: Message = Message {
+        body: pn.body(m, n),
+        subject: pn.text(m, FIELD_SUBJECT),
+        contentType: pn.text(m, FIELD_CONTENT_TYPE),
+        contentEncoding: pn.text(m, FIELD_CONTENT_ENCODING),
+        messageId: pn.text(m, FIELD_MESSAGE_ID),
+        correlationId: pn.text(m, FIELD_CORRELATION_ID),
+        replyTo: pn.text(m, FIELD_REPLY_TO),
+        to: pn.text(m, FIELD_TO),
+        groupId: pn.text(m, FIELD_GROUP_ID),
+        properties: props,
+        ttlMs: pn.number(m, 2),
+        createdAt: pn.number(m, 3),
+        priority: str.toInt(str.fromLong(pn.number(m, 1))),
+        durable: pn.number(m, 0) == 1,
+        exchange: pn.annotation(m, "x-exchange", n),
+        routingKey: pn.annotation(m, "x-routing-key", n),
+        deliveryCount: pn.number(m, 4),
+        redelivered: pn.number(m, 5) == 0
+    }
+    return Delivery { message: msg, m: m }
+}
+
+// amqp[s]://[user[:password]@]host[:port][/vhost], with percent-encoding.
+private fn addEndpoint(c: PConn, uri: string): void throws RabbitError {
+    let tls: bool = false
+    let rest: string = uri
+    if (rest.startsWith("amqps://")) {
+        tls = true
+        rest = rest.substring(8, rest.len())
+    } else if (rest.startsWith("amqp://")) {
+        rest = rest.substring(7, rest.len())
+    } else {
+        throw RabbitError("a uri starts with amqp:// or amqps://: " + uri, ERR_INVALID)
+    }
+
+    let vhost: string = "/"
+    let slash: int = rest.indexOf("/")
+    if (slash >= 0) {
+        let path: string = rest.substring(slash + 1, rest.len())
+        rest = rest.substring(0, slash)
+        if (!path.isEmpty()) {
+            vhost = pn.unescape(path)
+        }
+    }
+
+    let user: string = ""
+    let password: string = ""
+    let at: int = rest.indexOf("@")
+    if (at >= 0) {
+        let credentials: string = rest.substring(0, at)
+        rest = rest.substring(at + 1, rest.len())
+        let colon: int = credentials.indexOf(":")
+        if (colon >= 0) {
+            user = pn.unescape(credentials.substring(0, colon))
+            password = pn.unescape(credentials.substring(colon + 1, credentials.len()))
+        } else {
+            user = pn.unescape(credentials)
+        }
+    }
+
+    let host: string = rest
+    let port: string = "5672"
+    if (tls) {
+        port = "5671"
+    }
+
+    let colon: int = rest.indexOf(":")
+    if (colon >= 0) {
+        host = rest.substring(0, colon)
+        port = rest.substring(colon + 1, rest.len())
+    }
+
+    if (host.isEmpty()) {
+        host = "localhost"
+    }
+
+    check(pn.connEndpoint(c, host, port, user, password, vhost, tls))
+}

@@ -1,0 +1,71 @@
+// The two halves of chaos.sh. See there.
+
+import "fmt"
+import "os"
+import "str"
+import "time"
+import "github.com/ensamuel7/dex-modules/rabbitmq" as "rmq"
+
+fn connection(url: string): rmq.Connection throws rmq.RabbitError {
+    let o: rmq.Options = rmq.options(url)
+    o.backoffMs = 250
+    o.backoffMaxMs = 2000
+    o.publishTimeoutMs = 120000
+    o.connectTimeoutMs = 60000
+    return rmq.connectWith(o)
+}
+
+fn producing(url: string, queue: string, count: int): void throws rmq.RabbitError {
+    let c: rmq.Connection = connection(url)
+    c.declareQueue(rmq.quorumQueue(queue))
+    let p: rmq.Publisher = c.publisher(rmq.toQueue(queue))
+    for (let i: int = 0; i < count; i++) {
+        p.sendBody(str.fromInt(i))
+        // Paced to still be sending through both outages chaos.sh causes.
+        if (i % 2 == 0) {
+            time.sleep(1)
+        }
+
+        if (i % 10000 == 0) {
+            fmt.println("sent ${i}, in flight ${p.inFlight()}, accepted ${p.accepted()}, reconnects ${c.reconnects()}")
+        }
+    }
+
+    let left: int = p.flush(120000)
+    fmt.println(
+        "RESULT sent=${count} accepted=${p.accepted()} failed=${p.failed()} left=${left} reconnects=${c.reconnects()}"
+    )
+}
+
+// Prints each message before accepting it, so a line can repeat after a crash,
+// but an accepted message always has its line.
+fn consuming(url: string, queue: string, idleMs: int): void throws rmq.RabbitError {
+    let c: rmq.Connection = connection(url)
+    c.declareQueue(rmq.quorumQueue(queue))
+    let cons: rmq.Consumer = c.consumer(queue)
+    let idleSince: long = time.now()
+    while (time.now() - idleSince < idleMs) {
+        let d: rmq.Delivery? = cons.receive(500)
+        if (d != null) {
+            fmt.println("MSG " + d.message.body)
+            d.accept()
+            idleSince = time.now()
+        }
+    }
+
+    fmt.println("RESULT reconnects=${c.reconnects()}")
+}
+
+fn main(): void {
+    let a: string[] = os.args()
+    try {
+        if (a[0] == "produce") {
+            producing(a[1], a[2], str.toInt(a[3]))
+        } else {
+            consuming(a[1], a[2], str.toInt(a[3]))
+        }
+    } catch (e: rmq.RabbitError) {
+        fmt.println("FAILED (${e.code}) " + e.message)
+        os.exit(1)
+    }
+}

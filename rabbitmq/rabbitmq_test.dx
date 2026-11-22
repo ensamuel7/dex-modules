@@ -1,0 +1,843 @@
+// Against a real broker: RABBITMQ_URL, or amqp://dex:dexpass@localhost:5679 as
+// test.sh starts one. Everything here is named dexrmq.test.* and removed here.
+// With RABBITMQ_CONTAINER set to the broker's container, it also cuts the
+// connection from the broker's side, to test recovery.
+
+import "crypto"
+import "fmt"
+import "os"
+import "str"
+import "time"
+import "github.com/ensamuel7/dex-modules/rabbitmq" as "rmq"
+
+const ALL_BYTES: string =
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+
+let url: string = "amqp://dex:dexpass@localhost:5679"
+let container: string = ""
+let run: string = ""
+let serial: int = 0
+let made: string[] = []
+
+fn fresh(name: string): string {
+    serial = serial + 1
+    return "dexrmq.test." + run + "." + name + "." + str.fromInt(serial)
+}
+
+fn check(got: string, want: string): void {
+    if (got != want) {
+        fmt.println("want: " + want)
+        fmt.println("got:  " + got)
+        assert(false)
+    }
+}
+
+fn queueNamed(c: rmq.Connection, name: string, spec: rmq.QueueSpec): string throws rmq.RabbitError {
+    c.declareQueue(spec)
+    made.push(name)
+    return name
+}
+
+fn quorum(c: rmq.Connection, name: string): string throws rmq.RabbitError {
+    let q: string = fresh(name)
+    return queueNamed(c, q, rmq.quorumQueue(q))
+}
+
+fn take(cons: rmq.Consumer, n: int, ms: int = 10000): rmq.Delivery[] throws rmq.RabbitError {
+    let out: rmq.Delivery[] = []
+    while (out.len() < n) {
+        let d: rmq.Delivery? = cons.receive(ms)
+        if (d == null) {
+            let bodies: string = ""
+            foreach (out as got) {
+                bodies = bodies + " [" + got.message.body + "]"
+            }
+
+            fmt.println("timed out with ${out.len()} of ${n}:" + bodies)
+            assert(false)
+            return out
+        }
+
+        out.push(d)
+    }
+
+    return out
+}
+
+fn connecting(): void throws rmq.RabbitError {
+    let wrong: int = 0
+    let started: long = time.now()
+    try {
+        rmq.connect("amqp://dex:wrong@localhost:5679")
+    } catch (e: rmq.RabbitError) {
+        wrong = e.code
+    }
+
+    assert(wrong == rmq.ERR_AUTH)
+    assert(time.now() - started < 5000)
+
+    let o: rmq.Options = rmq.options("amqp://localhost:1")
+    o.connectTimeoutMs = 1500
+    let unreachable: int = 0
+    started = time.now()
+    try {
+        rmq.connectWith(o)
+    } catch (e: rmq.RabbitError) {
+        unreachable = e.code
+    }
+
+    assert(unreachable == rmq.ERR_TIMEOUT)
+    assert(time.now() - started < 5000)
+
+    let bad: int = 0
+    try {
+        rmq.connect("http://localhost")
+    } catch (e: rmq.RabbitError) {
+        bad = e.code
+    }
+
+    assert(bad == rmq.ERR_INVALID)
+
+    // A cluster's uris are tried in turn: the first is dead, the second is not.
+    let two: rmq.Options = rmq.options("amqp://dex:dexpass@localhost:1")
+    two.uris.push(url)
+    two.connectTimeoutMs = 10000
+    let c: rmq.Connection = rmq.connectWith(two)
+    assert(c.isOpen())
+    assert(c.state() == rmq.STATE_OPEN)
+    c.close()
+    assert(c.state() == rmq.STATE_CLOSED)
+    c.close()
+}
+
+fn topology(c: rmq.Connection): void throws rmq.RabbitError {
+    let q: string = fresh("topology")
+    queueNamed(c, q, rmq.quorumQueue(q).deliveryLimit(3))
+    let read: rmq.QueueInfo = c.queue(q)
+    check(read.kind, "quorum")
+    assert(read.durable)
+    assert(read.messages == 0)
+
+    // The same again is fine; the same name with other settings is not.
+    c.declareQueue(rmq.quorumQueue(q).deliveryLimit(3))
+    let conflict: int = 0
+    try {
+        c.declareQueue(rmq.classicQueue(q))
+    } catch (e: rmq.RabbitError) {
+        conflict = e.code
+    }
+
+    assert(conflict == rmq.ERR_PRECONDITION)
+
+    let p: rmq.Publisher = c.publisher(rmq.toQueue(q))
+    for (let i: int = 0; i < 5; i++) {
+        p.send(rmq.message(str.fromInt(i)))
+    }
+
+    assert(p.flush() == 0)
+    assert(c.queue(q).messages == 5)
+    assert(c.purgeQueue(q) == 5)
+    assert(c.queue(q).messages == 0)
+
+    let missing: int = 0
+    try {
+        c.queue(fresh("never.declared"))
+    } catch (e: rmq.RabbitError) {
+        missing = e.code
+    }
+
+    assert(missing == rmq.ERR_NOT_FOUND)
+    c.deleteQueue(q)
+    c.deleteQueue(q)
+
+    let classic: string = fresh("classic")
+    check(queueNamed(c, classic, rmq.classicQueue(classic).maxLength(2).messageTtl(60000)), classic)
+    check(c.queue(classic).kind, "classic")
+    let stream: string = fresh("stream")
+    queueNamed(c, stream, rmq.streamQueue(stream).maxAge("1h"))
+    check(c.queue(stream).kind, "stream")
+
+    // A name of any characters goes into a path, encoded.
+    let odd: string = fresh("odd name/with ü?&#")
+    queueNamed(c, odd, rmq.classicQueue(odd))
+    check(c.queue(odd).name, odd)
+}
+
+fn routing(c: rmq.Connection): void throws rmq.RabbitError {
+    let ex: string = fresh("ex.topic")
+    c.declareExchange(ex, "topic")
+    let orders: string = quorum(c, "orders")
+    let everything: string = quorum(c, "everything")
+    c.bind(ex, orders, "order.*")
+    c.bind(ex, everything, "#")
+
+    let p: rmq.Publisher = c.publisher(rmq.toExchange(ex, "order.created"))
+    assert(p.publish(rmq.message("one")).accepted())
+    let other: rmq.Publisher = c.publisher(rmq.toExchange(ex, "user.created"))
+    assert(other.publish(rmq.message("two")).accepted())
+    assert(c.queue(orders).messages == 1)
+    assert(c.queue(everything).messages == 2)
+
+    // Nowhere to go: the broker releases it rather than accepting it.
+    let nowhere: string = fresh("ex.nowhere")
+    c.declareExchange(nowhere, "direct")
+    let lost: rmq.Publisher = c.publisher(rmq.toExchange(nowhere, "k"))
+    let o: rmq.Outcome = lost.publish(rmq.message("nobody"))
+    assert(o.state == rmq.RELEASED)
+    assert(!o.accepted())
+    assert(lost.released() == 1)
+
+    c.unbind(ex, everything, "#")
+    assert(other.publish(rmq.message("three")).state == rmq.RELEASED)
+
+    // Exchange to exchange.
+    let fan: string = fresh("ex.fanout")
+    c.declareExchange(fan, "fanout")
+    c.bindExchange(fan, ex, "")
+    let viaFan: rmq.Publisher = c.publisher(rmq.toExchange(fan))
+    assert(viaFan.publish(rmq.message("four")).state == rmq.RELEASED)
+    c.bind(ex, everything, "#")
+    assert(viaFan.publish(rmq.message("five")).accepted())
+    c.unbindExchange(fan, ex, "")
+    assert(viaFan.publish(rmq.message("six")).state == rmq.RELEASED)
+
+    // A publisher whose messages name their own targets.
+    let roaming: rmq.Publisher = c.publisher(rmq.anywhere())
+    assert(roaming.publish(rmq.message("direct").withTo(rmq.toQueue(orders))).accepted())
+    assert(roaming.publish(rmq.message("via").withTo(rmq.toExchange(ex, "order.paid"))).accepted())
+    assert(c.queue(orders).messages == 3)
+
+    let cons: rmq.Consumer = c.consumer(orders)
+    let got: rmq.Delivery[] = take(cons, 3)
+    check(got[0].message.routingKey, "order.created")
+    check(got[0].message.exchange, ex)
+    foreach (got as d) {
+        assert(d.accept())
+    }
+
+    c.deleteExchange(nowhere)
+    c.deleteExchange(fan)
+    c.deleteExchange(ex)
+}
+
+fn messages(c: rmq.Connection): void throws rmq.RabbitError {
+    let q: string = quorum(c, "messages")
+    let p: rmq.Publisher = c.publisher(rmq.toQueue(q))
+    let everyByte: string = crypto.base64Decode(ALL_BYTES)
+    let full: rmq.Message = rmq.message(everyByte)
+        .withSubject("order.created")
+        .withContentType("application/octet-stream")
+        .withMessageId("m-1")
+        .withCorrelationId("c-1")
+        .withReplyTo("/queues/replies")
+        .withProperty("tenant", "acme")
+        .withProperty("empty", "")
+        .withPriority(7)
+        .withTtl(60000)
+    assert(p.publish(full).accepted())
+
+    let sb = StringBuilder()
+    for (let i: int = 0; i < 1048576; i++) {
+        sb.append('z')
+    }
+
+    let big: string = sb.toString()
+    assert(p.publish(rmq.message(big)).accepted())
+    assert(p.publish(rmq.message("")).accepted())
+    p.sendBody("plain")
+    assert(p.flush() == 0)
+
+    let cons: rmq.Consumer = c.consumer(q)
+    let got: rmq.Delivery[] = take(cons, 4)
+    let m: rmq.Message = got[0].message
+    assert(m.body.len() == 256)
+    assert(m.body == everyByte)
+    check(m.subject, "order.created")
+    check(m.contentType, "application/octet-stream")
+    check(m.messageId, "m-1")
+    check(m.correlationId, "c-1")
+    check(m.replyTo, "/queues/replies")
+    check(m.property("tenant"), "acme")
+    assert(m.properties.has("empty"))
+    check(m.property("missing"), "")
+    assert(m.priority == 7)
+    assert(m.durable)
+    assert(!m.redelivered)
+    assert(got[1].message.body.len() == 1048576)
+    assert(got[1].message.body == big)
+    assert(got[2].message.body.len() == 0)
+    check(got[3].message.body, "plain")
+    foreach (got as d) {
+        assert(d.accept())
+    }
+}
+
+fn outcomes(c: rmq.Connection): void throws rmq.RabbitError {
+    let q: string = quorum(c, "outcomes")
+    let p: rmq.Publisher = c.publisher(rmq.toQueue(q), 64)
+    let n: int = 3000
+    for (let i: int = 0; i < n; i++) {
+        p.sendTracked(rmq.message(str.fromInt(i)), 10000 + toLong(i))
+    }
+
+    let seen: map[int, bool] = {}
+    for (let i: int = 0; i < n; i++) {
+        let o: rmq.Outcome? = p.nextOutcome(10000)
+        assert(o != null)
+        if (o != null) {
+            assert(o.accepted())
+            let index: int = str.toInt(str.fromLong(o.tag)) - 10000
+            assert(index >= 0 && index < n)
+            assert(!seen.has(index))
+            seen.set(index, true)
+        }
+    }
+
+    let none: rmq.Outcome? = p.nextOutcome(0)
+    assert(none == null)
+    assert(p.accepted() == toLong(n))
+    assert(p.inFlight() == 0)
+    assert(c.queue(q).messages == toLong(n))
+
+    // A publisher to a queue that is not there is detached by the broker.
+    let ghost: rmq.Publisher = c.publisher(rmq.toQueue(fresh("ghost")))
+    let code: int = 0
+    try {
+        ghost.publish(rmq.message("x"))
+    } catch (e: rmq.RabbitError) {
+        code = e.code
+    }
+
+    assert(code == rmq.ERR_UNKNOWN_OUTCOME || code == rmq.ERR_LINK)
+    assert(!ghost.failure().isEmpty())
+    let later: int = 0
+    try {
+        ghost.send(rmq.message("y"))
+    } catch (e: rmq.RabbitError) {
+        later = e.code
+    }
+
+    assert(later == rmq.ERR_LINK)
+    assert(p.close() == 0)
+    let closed: int = 0
+    try {
+        p.send(rmq.message("late"))
+    } catch (e: rmq.RabbitError) {
+        closed = e.code
+    }
+
+    assert(closed == rmq.ERR_CLOSED)
+}
+
+fn toLong(i: int): long {
+    return str.toLong(str.fromInt(i))
+}
+
+fn settling(c: rmq.Connection): void throws rmq.RabbitError {
+    let dlx: string = fresh("dlx")
+    c.declareExchange(dlx, "fanout")
+    let dead: string = quorum(c, "dead")
+    c.bind(dlx, dead, "")
+    let q: string = fresh("settle")
+    queueNamed(c, q, rmq.quorumQueue(q).deadLetter(dlx, "").deliveryLimit(2))
+    let p: rmq.Publisher = c.publisher(rmq.toQueue(q))
+    for (let i: int = 0; i < 4; i++) {
+        p.send(rmq.message(str.fromInt(i)))
+    }
+
+    assert(p.flush() == 0)
+    let cons: rmq.Consumer = c.consumer(q, 10)
+
+    // Requeued: comes back, marked as not the first delivery.
+    let first: rmq.Delivery[] = take(cons, 4)
+    assert(first[0].requeue())
+    assert(!first[0].requeue())
+    assert(first[1].accept())
+    assert(first[2].discard())
+    assert(first[3].fail())
+
+    let again: rmq.Delivery[] = take(cons, 2)
+    let back: rmq.Delivery = again[0]
+    if (back.message.body != "0") {
+        back = again[1]
+    }
+
+    check(back.message.body, "0")
+    assert(back.message.redelivered)
+    assert(back.accept())
+
+    // Failed until past the delivery limit, 2: a quorum queue dead-letters a
+    // message once its delivery count exceeds the limit, so on the third fail.
+    let failing: rmq.Delivery = again[1]
+    if (failing.message.body != "3") {
+        failing = again[0]
+    }
+
+    check(failing.message.body, "3")
+    assert(failing.message.deliveryCount == 1)
+    assert(failing.fail())
+    let fails: int = 2
+    let going: bool = true
+    while (going) {
+        let more: rmq.Delivery? = cons.receive(3000)
+        if (more == null) {
+            going = false
+        } else {
+            check(more.message.body, "3")
+            assert(more.fail())
+            fails = fails + 1
+        }
+    }
+
+    assert(fails == 3)
+    let deadCons: rmq.Consumer = c.consumer(dead)
+    let deadLettered: rmq.Delivery[] = take(deadCons, 2)
+    let bodies: string = deadLettered[0].message.body + deadLettered[1].message.body
+    assert(bodies == "23" || bodies == "32")
+    foreach (deadLettered as d) {
+        d.accept()
+    }
+
+    // Let go of unsettled: back to the queue.
+    p.send(rmq.message("dropped"))
+    assert(p.flush() == 0)
+    dropOne(cons)
+    let redelivered: rmq.Delivery[] = take(cons, 1)
+    check(redelivered[0].message.body, "dropped")
+    assert(redelivered[0].message.redelivered)
+    assert(redelivered[0].accept())
+
+    // Paused: nothing new arrives until resumed.
+    cons.pause()
+    time.sleep(300)
+    p.send(rmq.message("after pause"))
+    assert(p.flush() == 0)
+    let quiet: rmq.Delivery? = cons.receive(1000)
+    assert(quiet == null)
+    cons.resume()
+    let resumed: rmq.Delivery[] = take(cons, 1)
+    check(resumed[0].message.body, "after pause")
+    resumed[0].accept()
+
+    let idle: rmq.Delivery? = cons.receive(200)
+    assert(idle == null)
+    cons.close()
+    let closed: int = 0
+    try {
+        cons.receive(100)
+    } catch (e: rmq.RabbitError) {
+        closed = e.code
+    }
+
+    assert(closed == rmq.ERR_CLOSED)
+
+    // A queue deleted under a consumer ends it.
+    let doomed: string = quorum(c, "doomed")
+    let watcher: rmq.Consumer = c.consumer(doomed)
+    let nothing: rmq.Delivery? = watcher.receive(300)
+    assert(nothing == null)
+    c.deleteQueue(doomed)
+    let ended: int = 0
+    let tries: int = 0
+    while (ended == 0 && tries < 50) {
+        try {
+            watcher.receive(100)
+        } catch (e: rmq.RabbitError) {
+            ended = e.code
+        }
+
+        tries = tries + 1
+    }
+
+    assert(ended == rmq.ERR_LINK)
+    assert(!watcher.failure().isEmpty())
+    c.deleteExchange(dlx)
+}
+
+fn dropOne(cons: rmq.Consumer): void throws rmq.RabbitError {
+    let d: rmq.Delivery[] = take(cons, 1)
+    check(d[0].message.body, "dropped")
+}
+
+fn streams(c: rmq.Connection): void throws rmq.RabbitError {
+    let s: string = fresh("stream.read")
+    queueNamed(c, s, rmq.streamQueue(s))
+    let p: rmq.Publisher = c.publisher(rmq.toQueue(s))
+    for (let i: int = 0; i < 10; i++) {
+        p.send(rmq.message(str.fromInt(i)))
+    }
+
+    assert(p.flush() == 0)
+    time.sleep(1100)
+    let midway: long = time.now()
+    time.sleep(100)
+    for (let i: int = 10; i < 15; i++) {
+        p.send(rmq.message(str.fromInt(i)))
+    }
+
+    assert(p.flush() == 0)
+
+    let all: rmq.Delivery[] = take(c.streamConsumer(s, rmq.fromFirst()), 15)
+    check(all[0].message.body, "0")
+    check(all[14].message.body, "14")
+    let fromFive: rmq.Delivery[] = take(c.streamConsumer(s, rmq.fromOffset(5)), 10)
+    check(fromFive[0].message.body, "5")
+    // A time attaches at a chunk, so it may start a little before: what is
+    // promised is everything from then on, in order.
+    let timed: rmq.Consumer = c.streamConsumer(s, rmq.fromTime(midway))
+    let fromTime: rmq.Delivery[] = []
+    let last: string = ""
+    while (last != "14") {
+        let got: rmq.Delivery[] = take(timed, 1)
+        fromTime.push(got[0])
+        last = got[0].message.body
+    }
+
+    assert(fromTime.len() >= 5)
+    assert(str.toInt(fromTime[0].message.body) <= 10)
+    for (let i: int = 1; i < fromTime.len(); i++) {
+        assert(str.toInt(fromTime[i].message.body) == str.toInt(fromTime[i - 1].message.body) + 1)
+    }
+
+    let next: rmq.Consumer = c.streamConsumer(s, rmq.fromNext())
+    let old: rmq.Delivery? = next.receive(800)
+    assert(old == null)
+    p.send(rmq.message("new"))
+    let fresh1: rmq.Delivery[] = take(next, 1)
+    check(fresh1[0].message.body, "new")
+    foreach (all as d) {
+        d.accept()
+    }
+}
+
+// Threads share one publisher; competing consumers on threads of their own see
+// every message exactly once between them.
+fn threads(c: rmq.Connection): void throws rmq.RabbitError {
+    let q: string = quorum(c, "threads")
+    let p: rmq.Publisher = c.publisher(rmq.toQueue(q))
+    let workers: int = 6
+    let each: int = 500
+    let done = channel(int)
+    for (let w: int = 0; w < workers; w++) {
+        spawn {
+            let bad: int = 0
+            for (let i: int = 0; i < each; i++) {
+                try {
+                    let m: rmq.Message = rmq.message(str.fromInt(w) + ":" + str.fromInt(i))
+                    if (i % 50 == 0) {
+                        if (!p.publish(m).accepted()) {
+                            bad = bad + 1
+                        }
+                    } else {
+                        p.send(m)
+                    }
+                } catch (e: rmq.RabbitError) {
+                    bad = bad + 1
+                }
+            }
+
+            send(done, bad)
+        }
+    }
+
+    for (let w: int = 0; w < workers; w++) {
+        assert(receive(done) == 0)
+    }
+
+    assert(p.flush() == 0)
+    assert(p.accepted() == toLong(workers * each))
+
+    let results = channel(string)
+    for (let r: int = 0; r < 3; r++) {
+        spawn {
+            let mine: string = ""
+            try {
+                let cons: rmq.Consumer = c.consumer(q, 50)
+                let quiet: int = 0
+                while (quiet < 3) {
+                    let d: rmq.Delivery? = cons.receive(500)
+                    if (d == null) {
+                        quiet = quiet + 1
+                    } else {
+                        mine = mine + d.message.body + ","
+                        d.accept()
+                        quiet = 0
+                    }
+                }
+
+                cons.close()
+            } catch (e: rmq.RabbitError) {
+                mine = "error: " + e.message
+            }
+
+            send(results, mine)
+        }
+    }
+
+    let seen: map[string, int] = {}
+    for (let r: int = 0; r < 3; r++) {
+        let got: string = receive(results)
+        assert(!got.startsWith("error"))
+        foreach (got.split(",") as v) {
+            if (!v.isEmpty()) {
+                assert(!seen.has(v))
+                seen.set(v, 1)
+            }
+        }
+    }
+
+    assert(seen.len() == workers * each)
+}
+
+fn cutConnections(): void {
+    let r: os.ExecResult = os.exec("docker exec " + container + " rabbitmqctl close_all_connections 'dexrmq test'")
+    assert(r.exitCode == 0)
+}
+
+// The broker drops the connection. It comes back by itself, with its exclusive
+// queue declared again and its consumer and publisher on it, and a publish
+// started during the outage completes.
+fn recovery(): void throws rmq.RabbitError {
+    if (container.isEmpty()) {
+        fmt.println("  skipped: recovery (set RABBITMQ_CONTAINER)")
+        return
+    }
+
+    let o: rmq.Options = rmq.options(url)
+    o.backoffMs = 200
+    let c: rmq.Connection = rmq.connectWith(o)
+    let q: string = fresh("exclusive")
+    c.declareQueue(rmq.classicQueue(q).exclusiveToConnection())
+    let durable: string = quorum(c, "recover")
+    let ex: string = fresh("ex.recover")
+    c.declareExchange(ex, "direct")
+    c.bind(ex, q, "k")
+    let p: rmq.Publisher = c.publisher(rmq.toExchange(ex, "k"))
+    let cons: rmq.Consumer = c.consumer(q)
+    assert(p.publish(rmq.message("before")).accepted())
+    let before: rmq.Delivery[] = take(cons, 1)
+    assert(before[0].accept())
+
+    let unsettled: rmq.Publisher = c.publisher(rmq.toQueue(durable))
+    unsettled.send(rmq.message("in flight"))
+    assert(unsettled.flush() == 0)
+    let held: rmq.Consumer = c.consumer(durable)
+    let heldOne: rmq.Delivery[] = take(held, 1)
+
+    cutConnections()
+    assert(c.waitOpen(20000))
+    assert(c.reconnects() == 1)
+
+    // A message held across the cut cannot be settled now; it comes again.
+    assert(!heldOne[0].accept())
+    let again: rmq.Delivery[] = take(held, 1)
+    check(again[0].message.body, "in flight")
+    assert(again[0].message.redelivered)
+    assert(again[0].accept())
+
+    // The exclusive queue went with the old connection, and is back; so is
+    // its binding, and the publisher and consumer on it.
+    assert(c.queue(q).durable)
+    assert(p.publish(rmq.message("after")).accepted())
+    let after: rmq.Delivery[] = take(cons, 1)
+    check(after[0].message.body, "after")
+    after[0].accept()
+
+    // Cut again, and publish while it is down.
+    cutConnections()
+    let outcome: rmq.Outcome = p.publish(rmq.message("during"))
+    assert(outcome.accepted())
+    let during: rmq.Delivery[] = take(cons, 1)
+    check(during[0].message.body, "during")
+    during[0].accept()
+    assert(c.reconnects() == 2)
+
+    let sawDown: bool = false
+    let sawBack: bool = false
+    foreach (c.events() as e) {
+        if (e.kind == rmq.EVENT_DOWN) {
+            sawDown = true
+        }
+
+        if (e.kind == rmq.EVENT_OPEN && e.message.contains("reconnected")) {
+            sawBack = true
+        }
+    }
+
+    assert(sawDown)
+    assert(sawBack)
+    c.deleteQueue(durable)
+    c.deleteExchange(ex)
+    c.close()
+}
+
+// Giving up: one reconnect attempt allowed, and it goes to the second uri,
+// where nothing listens. The connection closes for good, says why, and tells
+// whoever is waiting on it.
+fn givingUp(): void throws rmq.RabbitError {
+    if (container.isEmpty()) {
+        fmt.println("  skipped: giving up (set RABBITMQ_CONTAINER)")
+        return
+    }
+
+    let o: rmq.Options = rmq.options(url)
+    o.uris.push("amqp://dex:dexpass@localhost:1")
+    o.maxReconnectAttempts = 1
+    o.backoffMs = 100
+    let c: rmq.Connection = rmq.connectWith(o)
+    let q: string = quorum(c, "giving.up")
+    let cons: rmq.Consumer = c.consumer(q)
+    let p: rmq.Publisher = c.publisher(rmq.toQueue(q))
+    cutConnections()
+
+    let code: int = 0
+    try {
+        cons.receive(10000)
+    } catch (e: rmq.RabbitError) {
+        code = e.code
+    }
+
+    assert(code == rmq.ERR_CLOSED)
+    assert(c.state() == rmq.STATE_CLOSED)
+    let refused: int = 0
+    try {
+        p.send(rmq.message("too late"))
+    } catch (e: rmq.RabbitError) {
+        refused = e.code
+    }
+
+    assert(refused == rmq.ERR_CLOSED)
+    let late: int = 0
+    try {
+        c.declareQueue(rmq.quorumQueue(q))
+    } catch (e: rmq.RabbitError) {
+        late = e.code
+    }
+
+    assert(late == rmq.ERR_CLOSED || late == rmq.ERR_TIMEOUT)
+    let gaveUp: bool = false
+    foreach (c.events() as e) {
+        if (e.kind == rmq.EVENT_FAILED) {
+            gaveUp = e.message.contains("gave up")
+        }
+    }
+
+    assert(gaveUp)
+}
+
+// Clients made and dropped without closing, in every order.
+fn lifetimes(): void throws rmq.RabbitError {
+    for (let i: int = 0; i < 20; i++) {
+        let c: rmq.Connection = rmq.connect(url)
+        let p: rmq.Publisher = c.publisher(rmq.anywhere())
+        let q: string = quorum(c, "life")
+        p.send(rmq.message("x").withTo(rmq.toQueue(q)))
+        let cons: rmq.Consumer = c.consumer(q)
+        let d: rmq.Delivery? = cons.receive(5000)
+        assert(d != null)
+    }
+
+    // A publisher outliving its connection's variable keeps the connection.
+    let kept: rmq.Publisher = publisherAlone()
+    assert(kept.publish(rmq.message("still here").withTo(rmq.toQueue(made[made.len() - 1]))).accepted())
+}
+
+fn publisherAlone(): rmq.Publisher throws rmq.RabbitError {
+    let c: rmq.Connection = rmq.connect(url)
+    quorum(c, "alone")
+    return c.publisher(rmq.anywhere())
+}
+
+fn cleanUp(): void throws rmq.RabbitError {
+    let c: rmq.Connection = rmq.connect(url)
+    foreach (made as q) {
+        c.deleteQueue(q)
+    }
+
+    c.close()
+}
+
+let only: string = ""
+
+fn wanted(name: string): bool {
+    return only.isEmpty() || only == name
+}
+
+fn runAll(): void throws rmq.RabbitError {
+    if (wanted("connecting")) {
+        connecting()
+        fmt.println("  ok: connecting")
+    }
+
+    let c: rmq.Connection = rmq.connect(url)
+    if (wanted("topology")) {
+        topology(c)
+        fmt.println("  ok: topology")
+    }
+
+    if (wanted("routing")) {
+        routing(c)
+        fmt.println("  ok: routing")
+    }
+
+    if (wanted("messages")) {
+        messages(c)
+        fmt.println("  ok: messages")
+    }
+
+    if (wanted("outcomes")) {
+        outcomes(c)
+        fmt.println("  ok: outcomes")
+    }
+
+    if (wanted("settling")) {
+        settling(c)
+        fmt.println("  ok: settling")
+    }
+
+    if (wanted("streams")) {
+        streams(c)
+        fmt.println("  ok: streams")
+    }
+
+    if (wanted("threads")) {
+        threads(c)
+        fmt.println("  ok: threads")
+    }
+
+    if (wanted("recovery")) {
+        recovery()
+        fmt.println("  ok: recovery")
+    }
+
+    if (wanted("givingUp")) {
+        givingUp()
+        fmt.println("  ok: giving up")
+    }
+
+    if (wanted("lifetimes")) {
+        lifetimes()
+        fmt.println("  ok: lifetimes")
+    }
+
+    c.close()
+    cleanUp()
+    fmt.println("rabbitmq_test: all assertions passed")
+}
+
+fn main(): void {
+    let fromEnv: string = os.env("RABBITMQ_URL")
+    if (!fromEnv.isEmpty()) {
+        url = fromEnv
+    }
+
+    container = os.env("RABBITMQ_CONTAINER")
+    only = os.env("RMQ_ONLY")
+    run = str.fromLong(time.nowNs())
+    try {
+        runAll()
+    } catch (e: rmq.RabbitError) {
+        fmt.println("rabbitmq_test failed (${e.code}): " + e.message)
+        assert(false)
+    }
+}

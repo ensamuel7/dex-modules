@@ -12,6 +12,7 @@ released without a new compiler.
 | `sqlite/` | `github.com/ensamuel7/dex-modules/sqlite` | libsqlite3 | `brew install sqlite` / `apt install libsqlite3-dev` |
 | `redis/` | `github.com/ensamuel7/dex-modules/redis` | hiredis | `brew install hiredis` / `apt install libhiredis-dev` |
 | `kafka/` | `github.com/ensamuel7/dex-modules/kafka` | librdkafka | `brew install librdkafka` / `apt install librdkafka-dev` |
+| `rabbitmq/` | `github.com/ensamuel7/dex-modules/rabbitmq` | Qpid Proton, AMQP 1.0 to RabbitMQ 4 | `brew install qpid-proton` / `apt install libqpid-proton11-dev` |
 | `dexqu/` | `github.com/ensamuel7/dex-modules/dexqu` | nothing: a SQL query builder in pure Dex | |
 | `dexdns/` | `github.com/ensamuel7/dex-modules/dexdns` | nothing: DNS records at Cloudflare, Hetzner or PowerDNS, in pure Dex | |
 | `example/` | `github.com/ensamuel7/dex-modules/example` | uses both | |
@@ -84,6 +85,7 @@ cd sqlite  && dex run sqlite_test.dx
 cd redis   && dex run redis_test.dx
 cd dexqu   && dex run dexqu_test.dx && dex run sqldb_test.dx
 cd kafka   && dex run kafka_test.dx
+cd rabbitmq && ./test.sh          # starts a RabbitMQ 4 in Docker
 cd example && dex run main.dx
 ```
 

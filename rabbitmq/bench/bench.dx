@@ -1,0 +1,71 @@
+// Publish then consume 200,000 durable 100-byte messages on one queue, against
+// RABBITMQ_URL, or amqp://dex:dexpass@localhost:5679 as test.sh starts one.
+//
+//     dex run bench/bench.dx -- [window] [credit] [classic|quorum]
+
+import "fmt"
+import "num"
+import "os"
+import "str"
+import "time"
+import "github.com/ensamuel7/dex-modules/rabbitmq" as "rmq"
+
+fn main(): void {
+    try {
+        let a: string[] = os.args()
+        let window: int = 2000
+        let credit: int = 1000
+        let kind: string = "quorum"
+        if (a.len() >= 3) {
+            window = str.toInt(a[0])
+            credit = str.toInt(a[1])
+            kind = a[2]
+        }
+
+        let url: string = os.env("RABBITMQ_URL")
+        if (url.isEmpty()) {
+            url = "amqp://dex:dexpass@localhost:5679"
+        }
+
+        let c: rmq.Connection = rmq.connect(url)
+        let q: string = "dexrmq.bench." + kind
+        c.deleteQueue(q)
+        if (kind == "quorum") {
+            c.declareQueue(rmq.quorumQueue(q))
+        } else {
+            c.declareQueue(rmq.classicQueue(q))
+        }
+
+        let p: rmq.Publisher = c.publisher(rmq.toQueue(q), window)
+        let body: string =
+            "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
+        let n: int = 200000
+        let t0: long = time.nowNs()
+        for (let i: int = 0; i < n; i++) {
+            p.sendBody(body)
+        }
+
+        let left: int = p.flush(120000)
+        let ms: long = (time.nowNs() - t0) / 1000000
+        fmt.println(kind + " publish: ${num.toLong(n) * 1000 / ms} msg/s, accepted ${p.accepted()}, left ${left}")
+
+        let cons: rmq.Consumer = c.consumer(q, credit)
+        let got: int = 0
+        let t1: long = time.nowNs()
+        while (got < n) {
+            let d: rmq.Delivery? = cons.receive(10000)
+            if (d == null) {
+                break
+            }
+
+            d.accept()
+            got = got + 1
+        }
+
+        let ms2: long = (time.nowNs() - t1) / 1000000
+        fmt.println(kind + " consume: ${num.toLong(got) * 1000 / ms2} msg/s, got ${got}")
+        c.deleteQueue(q)
+    } catch (e: rmq.RabbitError) {
+        fmt.println("error: " + e.message)
+    }
+}

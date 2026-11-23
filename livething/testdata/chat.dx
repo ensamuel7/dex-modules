@@ -12,9 +12,11 @@ struct Chat {
         if (c.token == "bad") {
             return livething.refuse("invalid token")
         }
+
         if (c.token == "good") {
             return livething.accept("maya")
         }
+
         return livething.accept("")
     }
 
@@ -25,6 +27,7 @@ struct Chat {
             livething.broadcast(channel, "message", m)
             return
         }
+
         if (name == "poke") {
             c.emit("poked", { by: c.id })
         }
@@ -35,15 +38,18 @@ struct Chat {
             let agent: string = c.header("User-Agent")
             return livething.reply({ user: c.user, conn: c.id, path: c.path, agent: agent })
         }
+
         if (name == "who" && !channel.isEmpty()) {
             let list: string[] = livething.membersOf(channel)
             return livething.reply({ members: list })
         }
+
         if (name == "add") {
             // A sum written inside the literal encodes as null: DexLang wants a local.
             let sum: int = payload["a"].asInt() + payload["b"].asInt()
             return livething.reply({ sum: sum })
         }
+
         return livething.fail("not-found", { name: name })
     }
 
@@ -52,9 +58,11 @@ struct Chat {
         if (channel == "room:secret") {
             return "not-a-member"
         }
+
         if (!channel.startsWith("room:")) {
             return "channel-not-found"
         }
+
         return ""
     }
 

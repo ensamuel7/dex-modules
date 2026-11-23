@@ -8,22 +8,20 @@ struct User {
     name: string
 }
 
-fn loadUser(
-    db: sqlite.Database,
-    cache: redis.Client,
-    id: long
-): User? throws sqlite.SqliteError, redis.RedisError {
+fn loadUser(db: sqlite.Database, cache: redis.Client, id: long): User? throws sqlite.SqliteError, redis.RedisError {
     let key: string = "user:" + str.fromLong(id)
     let cached: string? = cache.get(key)
     if (cached != null) {
         fmt.println("cache hit  " + key)
         return User { id: id, name: cached }
     }
+
     let q: sqlite.Statement = db.prepare("SELECT name FROM users WHERE id = ?")
     q.bindLong(1, id)
     if (!q.next()) {
         return null
     }
+
     let name: string = q.getText(0)
     cache.setex(key, name, 60)
     fmt.println("cache miss " + key)
@@ -48,9 +46,8 @@ fn run(): void throws sqlite.SqliteError, redis.RedisError {
             fmt.println("  -> " + u.name)
         }
     }
-    fmt.println(
-        "sqlite " + sqlite.version() + ", " + str.fromInt(db.queryInt("SELECT count(*) FROM users")) + " users"
-    )
+
+    fmt.println("sqlite " + sqlite.version() + ", " + str.fromInt(db.queryInt("SELECT count(*) FROM users")) + " users")
 }
 
 fn main(): void {

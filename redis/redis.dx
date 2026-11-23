@@ -62,9 +62,11 @@ private fn argsOf(args: string[]): Args throws RedisError {
     if (a == null) {
         throw RedisError("out of memory")
     }
+
     foreach (args as arg) {
         c.argsPush(a, arg)
     }
+
     return a
 }
 
@@ -78,6 +80,7 @@ private fn itemsOf(r: Raw): string[] {
             items.push(c.itemStr(r, i))
         }
     }
+
     return items
 }
 
@@ -85,22 +88,28 @@ private fn replyOf(raw: Raw?): Reply throws RedisError {
     if (raw == null) {
         throw RedisError(c.lastError())
     }
+
     let k: int = c.kind(raw)
     if (k == ERROR) {
         throw RedisError(c.str(raw))
     }
+
     if (k == INTEGER) {
         return Reply { kind: Kind.Number, text: "", number: c.integer(raw), items: [] }
     }
+
     if (k == NIL) {
         return Reply { kind: Kind.Nil, text: "", number: 0, items: [] }
     }
+
     if (k == STATUS) {
         return Reply { kind: Kind.Status, text: c.str(raw), number: 0, items: [] }
     }
+
     if (k == ARRAY) {
         return Reply { kind: Kind.List, text: "", number: 0, items: itemsOf(raw) }
     }
+
     return Reply { kind: Kind.Text, text: c.str(raw), number: 0, items: [] }
 }
 
@@ -121,16 +130,19 @@ struct Subscriber {
             if (raw == null) {
                 return null
             }
+
             if (c.kind(raw) == ARRAY) {
                 let items: string[] = itemsOf(raw)
                 if (items.len() == 3 && items[0] == "message") {
                     return Message { channel: items[1], pattern: "", payload: items[2] }
                 }
+
                 if (items.len() == 4 && items[0] == "pmessage") {
                     return Message { channel: items[2], pattern: items[1], payload: items[3] }
                 }
             }
         }
+
         return null
     }
 }
@@ -147,6 +159,7 @@ struct Client {
         if (conn == null) {
             throw RedisError(c.lastError())
         }
+
         let sub: Subscriber = Subscriber { conn: conn }
         sub.subscribe(channel)
         return sub
@@ -169,6 +182,7 @@ struct Client {
         if (r.kind == Kind.Nil) {
             return null
         }
+
         return r.text
     }
 
@@ -209,6 +223,7 @@ struct Client {
         if (r.kind == Kind.Nil) {
             return null
         }
+
         return r.text
     }
 
@@ -218,6 +233,7 @@ struct Client {
         for (let i: int = 0; i + 1 < items.len(); i += 2) {
             out.set(items[i], items[i + 1])
         }
+
         return out
     }
 
@@ -271,5 +287,6 @@ fn connectPool(host: string, port: int, password: string, size: int): Client thr
     if (pool == null) {
         throw RedisError(c.lastError())
     }
+
     return Client { pool: pool }
 }

@@ -14,6 +14,7 @@ fn run(): void throws redis.RedisError {
     if (name != null) {
         assert(name == "hello world")
     }
+
     assert(r.exists("dexmod:name"))
     assert(r.del("dexmod:name") == 1)
     assert(!r.exists("dexmod:name"))
@@ -54,6 +55,7 @@ fn run(): void throws redis.RedisError {
         caught = true
         assert(e.message.contains("unknown command"))
     }
+
     assert(caught)
 
     let badAuth: bool = false
@@ -63,6 +65,7 @@ fn run(): void throws redis.RedisError {
         badAuth = true
         assert(e.message.contains("AUTH"))
     }
+
     assert(badAuth)
 
     let refused: bool = false
@@ -71,11 +74,13 @@ fn run(): void throws redis.RedisError {
     } catch (e: redis.RedisError) {
         refused = true
     }
+
     assert(refused)
 
     for (let i: int = 0; i < 200; i++) {
         r.set("dexmod:loop", str.fromInt(i))
     }
+
     r.del("dexmod:count")
     r.del("dexmod:list")
     r.del("dexmod:user")
@@ -93,6 +98,7 @@ fn bump(r: redis.Client, times: int): int {
     } catch (e: redis.RedisError) {
         return -1
     }
+
     return done
 }
 
@@ -110,11 +116,13 @@ fn pubsub(r: redis.Client): void throws redis.RedisError {
         assert(m1.channel == "dexmod:chan")
         assert(m1.payload == "one")
     }
+
     if (m2 != null) {
         assert(m2.channel == "dexmod:pat:x")
         assert(m2.pattern == "dexmod:pat:*")
         assert(m2.payload == "two")
     }
+
     if (m3 != null) {
         assert(m3.payload == "three has spaces")
     }
@@ -127,8 +135,10 @@ fn listen(sub: redis.Subscriber, count: int): string {
         if (m == null) {
             return got + "<dropped>"
         }
+
         got = got + m.payload + ";"
     }
+
     return got
 }
 
@@ -138,6 +148,7 @@ fn background(r: redis.Client): void throws redis.RedisError {
     spawn {
         send(ch, listen(sub, 3))
     }
+
     r.publish("dexmod:jobs", "a")
     r.publish("dexmod:jobs", "b")
     r.publish("dexmod:jobs", "c")
@@ -152,15 +163,18 @@ fn threads(r: redis.Client): void throws redis.RedisError {
             send(ch, bump(r, 50))
         }
     }
+
     let total: int = 0
     for (let t: int = 0; t < 16; t++) {
         total += receive(ch)
     }
+
     assert(total == 800)
     let count: string? = r.get("dexmod:shared")
     if (count != null) {
         assert(count == "800")
     }
+
     r.del("dexmod:shared")
 }
 

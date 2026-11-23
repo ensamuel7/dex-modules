@@ -1,22 +1,14 @@
-// dexdns: a domain's records at a DNS provider -- Cloudflare, Hetzner, or a
-// PowerDNS Authoritative server -- behind one interface.
+// dexdns: a domain's records at Cloudflare, Hetzner or a PowerDNS
+// Authoritative server, behind one interface.
 //
-// A Record is provider-neutral: names in full, lowercase, without the trailing
-// dot; hostnames in content likewise; TXT as the whole unquoted text; MX and SRV
-// with their priority apart from the content. Each provider turns that into its
-// own wire form and back, so a record read from one compares equal, with
-// sameValue, to the record it was written from.
+// A Record is provider-neutral: full lowercase names without the trailing dot,
+// TXT unquoted, MX and SRV priority kept apart from the content.
 //
-// Two ways to write. `replace` makes a name and type hold exactly the records
-// given. `update` adds some values and drops others, and leaves every other
-// value at that name and type alone: how a program edits only the records it
-// made -- its SPF beside a user's site-verification TXT at the apex -- while
-// keeping a note of what it made itself. Neither compares TTL or proxying: an
-// existing record with the same value is kept as it is.
+// `replace` makes a name and type hold exactly the records given; `update` adds
+// and drops values and leaves the rest alone. Neither compares TTL or proxying.
 //
-// Every call is one or a few HTTP requests. A method returning string returns
-// "" when done and the provider's reason otherwise; a Zone or a Listing carries
-// its reason in `problem`.
+// A method returning string returns "" on success, else the provider's reason;
+// a Zone or a Listing carries its reason in `problem`.
 
 import "http"
 import "json"
@@ -488,11 +480,8 @@ struct Hetzner {
     }
 }
 
-// A PowerDNS Authoritative server driven over its HTTP API. `api` is the
-// server's base, such as http://127.0.0.1:8081/api/v1/servers/localhost;
-// `nameservers` the names a registrar is pointed at, space-separated, such as
-// "ns1.example.net ns2.example.net"; `label` how its problems name it, such as
-// "DexRail's nameserver".
+// `api` is like http://127.0.0.1:8081/api/v1/servers/localhost; `nameservers`
+// is space-separated; `label` names the server in problems.
 struct PowerDns {
     api: string
     key: string

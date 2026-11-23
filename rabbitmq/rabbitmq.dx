@@ -123,11 +123,8 @@ const STATE_OPEN: int = 1
 const STATE_RECONNECTING: int = 2
 const STATE_CLOSED: int = 3
 
-// What the broker did with a message.
-// Accepted: it has it. Released: no queue took it, from an exchange with no
-// matching binding, say; sending it again will do the same unless that changes.
-// Rejected: refused, for a reason given. Modified: like released, but marked.
-// Failed: it never got an answer, so it may or may not have arrived.
+// What the broker did with a message. Released: no queue took it. Failed: no
+// answer came, so it may or may not have arrived.
 const ACCEPTED: int = 0
 const RELEASED: int = 1
 const REJECTED: int = 2

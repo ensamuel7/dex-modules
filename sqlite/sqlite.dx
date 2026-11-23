@@ -52,9 +52,11 @@ struct Database {
         if (rc != OK) {
             throw SqliteError(c.errmsg(self.handle), rc)
         }
+
         if (st == null) {
             throw SqliteError("no statement in: " + sql, rc)
         }
+
         return Statement { handle: st, db: self.handle }
     }
 
@@ -71,6 +73,7 @@ struct Database {
         if (!st.next()) {
             throw SqliteError("no rows: " + sql, DONE)
         }
+
         return st.getInt(0)
     }
 
@@ -79,6 +82,7 @@ struct Database {
         if (!st.next() || st.isNull(0)) {
             return null
         }
+
         return st.getText(0)
     }
 }
@@ -123,14 +127,17 @@ struct Statement {
         if (rc == ROW) {
             return true
         }
+
         if (rc == DONE) {
             return false
         }
+
         throw SqliteError(c.errmsg(self.db), rc)
     }
 
     fn run(): int throws SqliteError {
         while (self.next()) {}
+
         return c.changes(self.db)
     }
 
@@ -145,6 +152,7 @@ struct Statement {
         for (let i: int = 0; i < n; i++) {
             names.push(c.columnName(self.handle, i))
         }
+
         return names
     }
 
@@ -175,9 +183,11 @@ fn open(path: string): Database throws SqliteError {
     if (db == null) {
         throw SqliteError("out of memory opening " + path, rc)
     }
+
     if (rc != OK) {
         throw SqliteError(c.errmsg(db), rc)
     }
+
     return Database { handle: db }
 }
 

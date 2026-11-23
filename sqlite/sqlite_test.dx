@@ -12,6 +12,7 @@ fn seeded(): sqlite.Database throws sqlite.SqliteError {
         ins.run()
         ins.reset()
     }
+
     return db
 }
 
@@ -26,6 +27,7 @@ fn run(): void throws sqlite.SqliteError {
     if (grace != null) {
         assert(grace == "grace")
     }
+
     assert(db.queryString("SELECT name FROM users WHERE id = 99") == null)
 
     let q: sqlite.Statement = db.prepare("SELECT id, name, age, score FROM users WHERE age >= ? ORDER BY id")
@@ -39,6 +41,7 @@ fn run(): void throws sqlite.SqliteError {
         assert(q.getLong(0) >= 2)
         assert(q.getDouble(3) > 0.0)
     }
+
     assert(seen.len() == 2)
     assert(seen[0] == "grace")
     assert(seen[1] == "linus")
@@ -56,6 +59,7 @@ fn run(): void throws sqlite.SqliteError {
         assert(e.message.contains("missing"))
         assert(e.code == 1)
     }
+
     assert(caught)
 
     let failed: bool = false
@@ -64,6 +68,7 @@ fn run(): void throws sqlite.SqliteError {
     } catch (e: sqlite.SqliteError) {
         failed = true
     }
+
     assert(failed)
 
     for (let i: int = 0; i < 100; i++) {

@@ -85,6 +85,7 @@ fn exercise(p: dexdns.Provider, domain: string): void {
     while (key.len() < 410) {
         key = key + "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
     }
+
     let dkimName: string = "default._domainkey." + domain
     let dkim: dexdns.Record = rec(dkimName, "TXT", key, 0)
     assert(p.update(z, domain, dkimName, "TXT", [dkim], none).isEmpty())

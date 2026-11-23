@@ -426,14 +426,10 @@ struct Consumer {
         return partsOf(rd.assignment(self.h))
     }
 
-    // The next message, or null after timeoutMs. This is also what keeps the
-    // consumer in its group: call it at least every max.poll.interval.ms. Poll a
-    // consumer from one thread at a time.
-    //
-    // Throws for what needs attention, such as a topic that does not exist;
-    // polling again afterwards is fine unless the error is fatal. With
-    // enable.partition.eof set, the end of a partition comes back as a Message
-    // with eof true and no contents.
+    // Null after timeoutMs. Call at least every max.poll.interval.ms to stay in
+    // the group, from one thread at a time. Throws for errors such as a missing
+    // topic; polling again is fine unless the error is fatal.
+    // With enable.partition.eof, a partition's end is a Message with eof true.
     fn poll(timeoutMs: int): Message? throws KafkaError {
         return pollOne(self.h, timeoutMs)
     }

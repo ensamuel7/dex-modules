@@ -31,6 +31,7 @@ fn main(): void {
     while (key.len() < 410) {
         key = key + "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
     }
+
     let wire: string = dexdns.txtQuote(key)
     let pieces: string[] = wire.split("\" \"")
     assert(pieces.len() == 2)
@@ -58,11 +59,19 @@ fn main(): void {
 
     assert(dexdns.toWire("CNAME", rec("www.example.com", "CNAME", "example.com", 0)) == "example.com.")
     assert(dexdns.toWire("A", rec("example.com", "A", "203.0.113.5", 0)) == "203.0.113.5")
-    assert(dexdns.toWire("CAA", rec("example.com", "CAA", "0 issue \"letsencrypt.org\"", 0)) == "0 issue \"letsencrypt.org\"")
+    assert(
+        dexdns.toWire("CAA", rec("example.com", "CAA", "0 issue \"letsencrypt.org\"", 0)) ==
+        "0 issue \"letsencrypt.org\""
+    )
 
     // TXT compares exactly; hostnames without regard to case.
     assert(!dexdns.sameValue(rec("a.example.com", "TXT", "Hello", 0), rec("a.example.com", "TXT", "hello", 0)))
-    assert(dexdns.sameValue(rec("a.example.com", "cname", "B.example.com.", 0), rec("a.example.com", "CNAME", "b.example.com", 0)))
+    assert(
+        dexdns.sameValue(
+            rec("a.example.com", "cname", "B.example.com.", 0),
+            rec("a.example.com", "CNAME", "b.example.com", 0)
+        )
+    )
     assert(!dexdns.sameValue(rec("a.example.com", "A", "1.2.3.4", 0), rec("a.example.com", "AAAA", "1.2.3.4", 0)))
 
     // Merging: what was dropped goes, what was added comes, the rest stays.
@@ -86,7 +95,14 @@ fn main(): void {
 
     // TTLs: the largest asked for, or the default.
     assert(dexdns.ttlOf(merged) == dexdns.DEFAULT_TTL)
-    let slow: dexdns.Record = dexdns.Record { name: "example.com", type: "MX", content: "mail.example.com", ttl: 3600, priority: 10, proxied: false }
+    let slow: dexdns.Record = dexdns.Record {
+        name: "example.com",
+        type: "MX",
+        content: "mail.example.com",
+        ttl: 3600,
+        priority: 10,
+        proxied: false
+    }
     assert(dexdns.ttlOf([slow, mx]) == 3600)
 
     // URL escaping.

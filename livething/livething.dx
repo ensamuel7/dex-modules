@@ -123,6 +123,13 @@ fn keepalive(ping: int, idle: int): void {
 
 // Blocks. One App per program.
 fn serve(app: App, port: int): void {
+    serveOn(app, "", port)
+}
+
+// Like `serve`, bound to one IPv4 address ("127.0.0.1"), or every one for "":
+// for a server behind a proxy on the same machine that should not also answer
+// directly.
+fn serveOn(app: App, host: string, port: int): void {
     mu.lock()
     apps.push(app)
     let ping: int = pingMs
@@ -137,7 +144,7 @@ fn serve(app: App, port: int): void {
     ws.handleConnect(opened)
     ws.handleMessage(received)
     ws.handleDisconnect(gone)
-    ws.listen(port)
+    ws.listenOn(host, port)
 }
 
 // ---- Sending ----

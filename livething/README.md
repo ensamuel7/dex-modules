@@ -62,7 +62,8 @@ server to infer them from: write the contract interface by hand, or use `any`.
 
 ## The App
 
-A program implements `App` and calls `serve(app, port)`, which blocks.
+A program implements `App` and calls `serve(app, port)`, which blocks. `serveOn(app, host, port)` is the same bound to one IPv4 address, such as
+`"127.0.0.1"` behind a proxy on the same machine (dex 0.9.44 and later).
 
 | Method | Called |
 |---|---|

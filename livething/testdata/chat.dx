@@ -1,0 +1,71 @@
+// A small chat for the end-to-end test (test.sh): token "good" signs in as
+// "maya", "bad" is refused, none is a guest. Rooms are `room:<name>`, and
+// `room:secret` refuses everyone.
+import "fmt"
+import "json"
+import "os"
+import "str"
+import "github.com/ensamuel7/dex-modules/livething"
+
+struct Chat {
+    fn authenticate(c: livething.Conn): livething.Auth {
+        if (c.token == "bad") {
+            return livething.refuse("invalid token")
+        }
+        if (c.token == "good") {
+            return livething.accept("maya")
+        }
+        return livething.accept("")
+    }
+
+    fn event(c: livething.Conn, channel: string, name: string, payload: json.Value): void {
+        if (name == "send-message" && !channel.isEmpty()) {
+            let text: string = payload["text"].asString()
+            let m: json.Value = { text: text, from: c.user, conn: c.id }
+            livething.broadcast(channel, "message", m)
+            return
+        }
+        if (name == "poke") {
+            c.emit("poked", { by: c.id })
+        }
+    }
+
+    fn request(c: livething.Conn, channel: string, name: string, payload: json.Value): livething.Reply {
+        if (name == "get-profile") {
+            let agent: string = c.header("User-Agent")
+            return livething.reply({ user: c.user, conn: c.id, path: c.path, agent: agent })
+        }
+        if (name == "who" && !channel.isEmpty()) {
+            let list: string[] = livething.membersOf(channel)
+            return livething.reply({ members: list })
+        }
+        if (name == "add") {
+            // A sum written inside the literal encodes as null: DexLang wants a local.
+            let sum: int = payload["a"].asInt() + payload["b"].asInt()
+            return livething.reply({ sum: sum })
+        }
+        return livething.fail("not-found", { name: name })
+    }
+
+    #[allow(unused-param)]
+    fn subscribe(c: livething.Conn, channel: string, family: string, payload: json.Value): string {
+        if (channel == "room:secret") {
+            return "not-a-member"
+        }
+        if (!channel.startsWith("room:")) {
+            return "channel-not-found"
+        }
+        return ""
+    }
+
+    fn closed(c: livething.Conn): void {
+        fmt.println("closed " + c.id)
+    }
+}
+
+fn main(): void {
+    let port: string = os.env("PORT")
+    livething.keepalive(1000, 3000)
+    fmt.println("listening on " + port)
+    livething.serve(Chat {}, str.toInt(port))
+}

@@ -1,0 +1,49 @@
+// livething without a socket: frames, metadata and the bookkeeping strings.
+// test.sh runs this, then the stock @livething/client against testdata/chat.dx.
+import "json"
+import "github.com/ensamuel7/dex-modules/livething"
+
+fn main(): void {
+    // Frames are three items, the metadata null rather than left out.
+    let p: json.Value = { text: "hi" }
+    assert(livething.frame("message", p, livething.nothing()) == "[\"message\",{\"text\":\"hi\"},null]")
+    assert(livething.frame("__unsubscribeOk__", livething.nothing(), livething.nothing()) == "[\"__unsubscribeOk__\",null,null]")
+
+    // Channel metadata names the family only when there is one.
+    assert(json.encode(livething.channelMeta("room:1", "")) == "{\"channel\":{\"name\":\"room:1\"}}")
+    assert(json.encode(livething.channelMeta("room:1", "rooms")) == "{\"channel\":{\"name\":\"room:1\",\"family\":\"rooms\"}}")
+
+    // A reply carries the request's exchange, and its channel when it had one.
+    assert(json.encode(livething.exchangeMeta("r1", "", "")) == "{\"exchange\":{\"id\":\"r1\",\"source\":\"client\"}}")
+    assert(json.encode(livething.exchangeMeta("r1", "room:1", "rooms")) == "{\"exchange\":{\"id\":\"r1\",\"source\":\"client\"},\"channel\":{\"name\":\"room:1\",\"family\":\"rooms\"}}")
+
+    // Errors: a detail only when given.
+    assert(livething.errorFrame("not-found", livething.nothing(), livething.nothing()) == "[\"__error__\",{\"code\":\"not-found\"},null]")
+    let d: json.Value = { name: "x" }
+    assert(livething.errorFrame("not-found", d, livething.nothing()) == "[\"__error__\",{\"code\":\"not-found\",\"detail\":{\"name\":\"x\"}},null]")
+
+    // Replies.
+    let r: livething.Reply = livething.fail("forbidden", livething.nothing())
+    assert(r.error == "forbidden" && r.payload.isNull())
+    let ok: livething.Reply = livething.reply(p)
+    assert(ok.error.isEmpty() && ok.payload["text"].asString() == "hi")
+
+    // Names LiveThing keeps.
+    assert(livething.reserved("__subscribe__"))
+    assert(livething.reserved("__x"))
+    assert(livething.reserved("x__"))
+    assert(!livething.reserved("send-message"))
+    assert(livething.bounded("a", 1) && !livething.bounded("", 1) && !livething.bounded("ab", 1))
+
+    // The token subprotocol is base64url without padding; other names are skipped.
+    assert(livething.tokenFromProtocols("livething-v1, livething-v1.token.Z29vZA") == "good")
+    assert(livething.tokenFromProtocols("chat.v1,livething-v1.token.ZXlKaGJHY2lPaUpJVXpJMU5pSjk") == "eyJhbGciOiJIUzI1NiJ9")
+    assert(livething.tokenFromProtocols("livething-v1") == "")
+    assert(livething.tokenFromProtocols("") == "")
+
+    // Members are fds in ",3,7,".
+    let fds: int[] = livething.fdList(",3,17,")
+    assert(fds.len() == 2 && fds[0] == 3 && fds[1] == 17)
+    assert(livething.fdList(",").len() == 0)
+    assert(livething.fdList("").len() == 0)
+}

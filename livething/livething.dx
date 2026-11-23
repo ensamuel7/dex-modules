@@ -1,0 +1,648 @@
+// livething: a LiveThing server in Dex. Browsers and Node programs connect with
+// the stock `@livething/client` package, over a WebSocket, and speak LiveThing's
+// wire protocol (https://livething.dev/core/learn/wire-protocol) to it.
+//
+// A program implements `App` and calls `serve`. Every frame is the three-item
+// JSON array [event, payload, metadata]; this module reads and writes those, so
+// the App sees events, requests and channel joins, never frames.
+//
+// What it speaks: `__connected__`, events and requests in both channel and
+// connection scope, typed `__error__` replies, joining and leaving channels,
+// broadcasts, being kicked, and keepalive pings. What it does not: replay,
+// streams, uploads, binary frames, presence, awareness, inboxes and the http()
+// transport. `__connected__` lists no features, so a client using one of those
+// primitives logs a warning, and a frame for one gets `__error__`.
+//
+// Handlers run on the WebSocket server's worker threads, several at once, and
+// two frames of one connection may run out of order. `authenticate` runs on
+// the event loop when the connection opens, before any of its frames: keep it
+// short.
+
+import "crypto"
+import "json"
+import "str"
+import "time"
+import "ws"
+
+const PROTOCOL: string = "livething-v1"
+const TOKEN_PREFIX: string = "livething-v1.token."
+
+// LiveThing's wire limits for the names this module reads (`WIRE_LIMITS`).
+const MAX_EVENT: int = 128
+const MAX_CHANNEL: int = 256
+const MAX_ID: int = 128
+
+// One connection, as the App sees it. `id` is what the client is told in
+// `__connected__`; `user` is what `authenticate` answered, "" for a guest.
+// `path` is the request target, query included. `token` is an
+// `Authorization: Bearer` header or the client's `token` option.
+struct Conn {
+    id: string
+    user: string
+    path: string
+    token: string
+    fd: int
+
+    // A header of the request that opened the connection ("" if absent), such
+    // as `Cookie` or `Origin`.
+    fn header(name: string): string {
+        return ws.header(socketOf(fd), name)
+    }
+
+    // Send this connection an event.
+    fn emit(event: string, payload: json.Value): void {
+        ws.send(socketOf(fd), frame(event, payload, nothing()))
+    }
+
+    fn close(): void {
+        ws.close(socketOf(fd))
+    }
+}
+
+// What `authenticate` decides. A non-empty `refuse` closes the connection with
+// no `__connected__`, so the client never counts it as open.
+struct Auth {
+    user: string
+    refuse: string
+}
+
+// The answer to a request: its payload, or an error code (`__error__`'s
+// `code`) with a detail. Make one with `reply` or `fail`.
+struct Reply {
+    payload: json.Value
+    error: string
+    detail: json.Value
+}
+
+interface App {
+    // Accept a new connection, as `user` ("" for a guest), or refuse it.
+    fn authenticate(c: Conn): Auth
+
+    // An event the client sent; `channel` is "" outside a channel.
+    fn event(c: Conn, channel: string, name: string, payload: json.Value): void
+
+    // A request the client sent; the client waits for the Reply.
+    fn request(c: Conn, channel: string, name: string, payload: json.Value): Reply
+
+    // Whether `c` may join `channel` (with `family`, the dynamic channel's key,
+    // when the client named one): "" lets it in, anything else is the
+    // `__error__` code it gets instead, such as "channel-not-found".
+    fn subscribe(c: Conn, channel: string, family: string, payload: json.Value): string
+
+    // `c` is gone, and has left all its channels.
+    fn closed(c: Conn): void
+}
+
+fn accept(user: string): Auth {
+    return Auth { user: user, refuse: "" }
+}
+
+fn refuse(reason: string): Auth {
+    return Auth { user: "", refuse: reason }
+}
+
+fn reply(payload: json.Value): Reply {
+    return Reply { payload: payload, error: "", detail: nothing() }
+}
+
+fn fail(code: string, detail: json.Value): Reply {
+    return Reply { payload: nothing(), error: code, detail: detail }
+}
+
+// JSON null, for a payload or a detail that has none.
+fn nothing(): json.Value {
+    let v: json.Value = json.decode("null")
+    return v
+}
+
+// --- State -------------------------------------------------------------------
+//
+// Maps hold only plain values, so a connection is a row across maps keyed by
+// its socket's fd as text, and a channel's members are fds in one string
+// (",3,7,"). Everything here is under `mu`; the App is always called outside it.
+
+let mu: mutex = mutex
+let apps: App[] = []
+let ids: map[string, string] = {}       // fd -> connection id
+let fds: map[string, string] = {}       // connection id -> fd
+let users: map[string, string] = {}     // fd -> user
+let paths: map[string, string] = {}     // fd -> path
+let tokens: map[string, string] = {}    // fd -> token
+let joined: map[string, string] = {}    // fd -> "\nch\nch\n"
+let seen: map[string, long] = {}        // fd -> last frame, ms
+let members: map[string, string] = {}   // channel -> ",fd,fd,"
+let families: map[string, string] = {}  // channel -> its family key
+let pingMs: int = 30000
+let idleMs: int = 60000
+
+// The keepalive timings sent in `__connected__`: the server pings every
+// `ping` ms and drops a connection silent for `idle` ms; the client pings at
+// the same interval. 0 turns both off. Call before `serve`.
+fn keepalive(ping: int, idle: int): void {
+    mu.lock()
+    pingMs = ping
+    idleMs = idle
+    mu.unlock()
+}
+
+// Run `app` on `port`, blocking. One App per program.
+fn serve(app: App, port: int): void {
+    mu.lock()
+    apps.push(app)
+    let ping: int = pingMs
+    mu.unlock()
+    if (ping > 0) {
+        spawn { keep() }
+    }
+    ws.setProtocol(PROTOCOL)
+    ws.handleConnect(opened)
+    ws.handleMessage(received)
+    ws.handleDisconnect(gone)
+    ws.listen(port)
+}
+
+// --- Sending from anywhere -----------------------------------------------------
+
+// Send one connection an event; false if it is gone.
+fn emit(connId: string, event: string, payload: json.Value): bool {
+    let fd: int = fdOfId(connId)
+    if (fd < 0) {
+        return false
+    }
+    ws.send(socketOf(fd), frame(event, payload, nothing()))
+    return true
+}
+
+// Send every connection signed in as `user` an event; how many there were.
+fn toUser(user: string, event: string, payload: json.Value): int {
+    let text: string = frame(event, payload, nothing())
+    let targets: int[] = []
+    mu.lock()
+    let keys: string[] = users.keys()
+    for (let i: int = 0; i < keys.len(); i++) {
+        if (users[keys[i]] == user) {
+            targets.push(str.toInt(keys[i]))
+        }
+    }
+    mu.unlock()
+    for (let i: int = 0; i < targets.len(); i++) {
+        ws.send(socketOf(targets[i]), text)
+    }
+    return targets.len()
+}
+
+// Send every member of `channel` an event; how many there were.
+fn broadcast(channel: string, event: string, payload: json.Value): int {
+    return broadcastExcept(channel, "", event, payload)
+}
+
+// The same, leaving out the connection `except` (the sender, say).
+fn broadcastExcept(channel: string, except: string, event: string, payload: json.Value): int {
+    mu.lock()
+    let list: int[] = fdList(textAt(members, channel, ""))
+    let family: string = textAt(families, channel, "")
+    let skip: int = str.toInt(textAt(fds, except, "-1"))
+    mu.unlock()
+    let text: string = frame(event, payload, channelMeta(channel, family))
+    let sent: int = 0
+    for (let i: int = 0; i < list.len(); i++) {
+        if (list[i] != skip) {
+            ws.send(socketOf(list[i]), text)
+            sent = sent + 1
+        }
+    }
+    return sent
+}
+
+// The connection ids in `channel`.
+fn membersOf(channel: string): string[] {
+    let out: string[] = []
+    mu.lock()
+    let list: int[] = fdList(textAt(members, channel, ""))
+    for (let i: int = 0; i < list.len(); i++) {
+        let key: string = str.fromInt(list[i])
+        if (ids.has(key)) {
+            out.push(ids[key])
+        }
+    }
+    mu.unlock()
+    return out
+}
+
+// Take a connection out of `channel`, telling it why (`__kicked__`).
+fn kick(connId: string, channel: string, reason: string): bool {
+    let fd: int = fdOfId(connId)
+    if (fd < 0 || !leave(fd, channel)) {
+        return false
+    }
+    let detail: json.Value = { reason: reason }
+    ws.send(socketOf(fd), frame("__kicked__", detail, channelMeta(channel, familyOf(channel))))
+    return true
+}
+
+// Close a connection.
+fn disconnect(connId: string): bool {
+    let fd: int = fdOfId(connId)
+    if (fd < 0) {
+        return false
+    }
+    ws.close(socketOf(fd))
+    return true
+}
+
+// How many connections are open.
+fn connections(): int {
+    mu.lock()
+    let n: int = ids.len()
+    mu.unlock()
+    return n
+}
+
+// --- Frames --------------------------------------------------------------------
+
+// One wire frame. `meta` is null or a non-empty object, never `{}`.
+fn frame(event: string, payload: json.Value, meta: json.Value): string {
+    let f: json.Value = [event, payload, meta]
+    return json.encode(f)
+}
+
+fn channelMeta(channel: string, family: string): json.Value {
+    if (family.isEmpty()) {
+        let m: json.Value = { channel: { name: channel } }
+        return m
+    }
+    let m: json.Value = { channel: { name: channel, family: family } }
+    return m
+}
+
+// A request's reply metadata: its exchange, and its channel when it had one.
+fn exchangeMeta(id: string, channel: string, family: string): json.Value {
+    if (channel.isEmpty()) {
+        let m: json.Value = { exchange: { id: id, source: "client" } }
+        return m
+    }
+    if (family.isEmpty()) {
+        let m: json.Value = { exchange: { id: id, source: "client" }, channel: { name: channel } }
+        return m
+    }
+    let m: json.Value = { exchange: { id: id, source: "client" }, channel: { name: channel, family: family } }
+    return m
+}
+
+fn errorFrame(code: string, detail: json.Value, meta: json.Value): string {
+    if (detail.isNull()) {
+        let p: json.Value = { code: code }
+        return frame("__error__", p, meta)
+    }
+    let p: json.Value = { code: code, detail: detail }
+    return frame("__error__", p, meta)
+}
+
+// Whether `event` is a name LiveThing keeps for itself.
+fn reserved(event: string): bool {
+    return event.startsWith("__") || event.endsWith("__")
+}
+
+fn bounded(s: string, limit: int): bool {
+    return !s.isEmpty() && s.len() <= limit
+}
+
+// The client's token: an `Authorization: Bearer <token>` header, else the
+// subprotocol `livething-v1.token.<base64url>` the client's `token` option
+// sends (a browser cannot set the header). A real header wins, as in LiveThing.
+fn tokenOf(sock: ws.Conn): string {
+    let auth: string = ws.header(sock, "Authorization")
+    if (auth.startsWith("Bearer ")) {
+        return auth.substring(7, auth.len()).trim()
+    }
+    return tokenFromProtocols(ws.header(sock, "Sec-WebSocket-Protocol"))
+}
+
+// The token in a `Sec-WebSocket-Protocol` offer list, "" when none.
+fn tokenFromProtocols(offered: string): string {
+    let names: string[] = offered.split(",")
+    for (let i: int = 0; i < names.len(); i++) {
+        let name: string = names[i].trim()
+        if (name.startsWith(TOKEN_PREFIX)) {
+            return crypto.base64UrlDecode(name.substring(TOKEN_PREFIX.len(), name.len()))
+        }
+    }
+    return ""
+}
+
+// --- The socket's handlers -------------------------------------------------------
+
+fn opened(sock: ws.Conn, path: string): void {
+    let a: App = theApp()
+    let c: Conn = Conn { id: "c_" + crypto.randomHex(8), user: "", path: path, token: tokenOf(sock), fd: sock.fd }
+    let auth: Auth = a.authenticate(c)
+    if (!auth.refuse.isEmpty()) {
+        ws.close(sock)
+        return
+    }
+    let key: string = str.fromInt(sock.fd)
+    mu.lock()
+    ids[key] = c.id
+    fds[c.id] = key
+    users[key] = auth.user
+    paths[key] = path
+    tokens[key] = c.token
+    joined[key] = "\n"
+    seen[key] = time.now()
+    let ping: int = pingMs
+    let idle: int = idleMs
+    mu.unlock()
+
+    // Both timings are null when the server sends no pings.
+    let pingValue: json.Value = nothing()
+    let idleValue: json.Value = nothing()
+    if (ping > 0) {
+        pingValue = json.decode(str.fromInt(ping))
+        idleValue = json.decode(str.fromInt(idle))
+    }
+    let features: string[] = []
+    let info: json.Value = {
+        pingIntervalMs: pingValue,
+        idleTimeoutMs: idleValue,
+        maxResumeTokens: 0,
+        connectionId: c.id,
+        features: features,
+        resume: nothing(),
+        secret: nothing(),
+        maxPostBytes: nothing()
+    }
+    ws.send(sock, frame("__connected__", info, nothing()))
+}
+
+fn received(sock: ws.Conn, msg: string): void {
+    let key: string = str.fromInt(sock.fd)
+    let c: Conn = connOf(sock.fd)
+    if (c.id.isEmpty()) {
+        return
+    }
+    mu.lock()
+    seen[key] = time.now()
+    mu.unlock()
+    if (msg == "ping") {
+        ws.send(sock, "pong")
+        return
+    }
+    if (msg == "pong") {
+        return
+    }
+
+    // Not JSON, or not three items with a string event: dropped, as LiveThing does.
+    let f: json.Value = json.decode(msg)
+    if (!f.isArray() || f.len() != 3 || !f[0].isString()) {
+        return
+    }
+    let event: string = f[0].asString()
+    let payload: json.Value = f[1]
+    let meta: json.Value = f[2]
+    if (!bounded(event, MAX_EVENT) || !(meta.isNull() || meta.isObject())) {
+        return
+    }
+
+    let channel: string = meta["channel"]["name"].asString()
+    let family: string = meta["channel"]["family"].asString()
+    let exchange: string = meta["exchange"]["id"].asString()
+    if (meta.has("channel") && !bounded(channel, MAX_CHANNEL)) {
+        ws.send(sock, errorFrame("validation-failed", nothing(), nothing()))
+        return
+    }
+
+    if (event == "__subscribe__") {
+        subscribed(sock, c, channel, family, payload)
+        return
+    }
+    if (event == "__unsubscribe__") {
+        unsubscribed(sock, channel, meta["channel"]["unsubscribeId"].asString())
+        return
+    }
+    if (reserved(event)) {
+        ws.send(sock, errorFrame("unsupported-protocol", { event: event }, meta))
+        return
+    }
+
+    if (!channel.isEmpty() && !isMember(sock.fd, channel)) {
+        ws.send(sock, errorFrame("channel-not-subscribed", nothing(), meta))
+        return
+    }
+    let a: App = theApp()
+    if (meta.has("exchange")) {
+        if (!bounded(exchange, MAX_ID)) {
+            ws.send(sock, errorFrame("validation-failed", nothing(), nothing()))
+            return
+        }
+        let r: Reply = a.request(c, channel, event, payload)
+        let back: json.Value = exchangeMeta(exchange, channel, family)
+        if (!r.error.isEmpty()) {
+            ws.send(sock, errorFrame(r.error, r.detail, back))
+            return
+        }
+        ws.send(sock, frame(event, r.payload, back))
+        return
+    }
+    a.event(c, channel, event, payload)
+}
+
+fn subscribed(sock: ws.Conn, c: Conn, channel: string, family: string, payload: json.Value): void {
+    let where: json.Value = channelMeta(channel, family)
+    if (channel.isEmpty() || channel.contains("\n")) {
+        ws.send(sock, errorFrame("validation-failed", nothing(), nothing()))
+        return
+    }
+    let a: App = theApp()
+    let refused: string = a.subscribe(c, channel, family, payload)
+    if (!refused.isEmpty()) {
+        ws.send(sock, errorFrame(refused, nothing(), where))
+        return
+    }
+    let key: string = str.fromInt(sock.fd)
+    mu.lock()
+    if (!ids.has(key)) {
+        mu.unlock()
+        return
+    }
+    let list: string = textAt(members, channel, ",")
+    if (!list.contains("," + key + ",")) {
+        members[channel] = list + key + ","
+        joined[key] = joined[key] + channel + "\n"
+    }
+    if (!family.isEmpty()) {
+        families[channel] = family
+    }
+    mu.unlock()
+    let ok: json.Value = {}
+    let confirm: json.Value = { channel: { name: channel, membership: "ephemeral" } }
+    if (!family.isEmpty()) {
+        confirm = { channel: { name: channel, family: family, membership: "ephemeral" } }
+    }
+    ws.send(sock, frame("__subscribeOk__", ok, confirm))
+}
+
+fn unsubscribed(sock: ws.Conn, channel: string, unsubscribeId: string): void {
+    leave(sock.fd, channel)
+    let family: string = familyOf(channel)
+    let m: json.Value = channelMeta(channel, family)
+    if (!unsubscribeId.isEmpty()) {
+        m = { channel: { name: channel, unsubscribeId: unsubscribeId } }
+        if (!family.isEmpty()) {
+            m = { channel: { name: channel, family: family, unsubscribeId: unsubscribeId } }
+        }
+    }
+    ws.send(sock, frame("__unsubscribeOk__", nothing(), m))
+}
+
+fn gone(sock: ws.Conn): void {
+    let c: Conn = connOf(sock.fd)
+    if (c.id.isEmpty()) {
+        return
+    }
+    let key: string = str.fromInt(sock.fd)
+    mu.lock()
+    let chans: string[] = joined[key].split("\n")
+    for (let i: int = 0; i < chans.len(); i++) {
+        dropMember(chans[i], key)
+    }
+    ids.remove(key)
+    fds.remove(c.id)
+    users.remove(key)
+    paths.remove(key)
+    tokens.remove(key)
+    joined.remove(key)
+    seen.remove(key)
+    mu.unlock()
+    let a: App = theApp()
+    a.closed(c)
+}
+
+// Pings every connection each interval and closes the ones silent too long.
+fn keep(): void {
+    while (true) {
+        mu.lock()
+        let ping: int = pingMs
+        let idle: int = idleMs
+        let now: long = time.now()
+        let alive: int[] = []
+        let dead: int[] = []
+        let keys: string[] = seen.keys()
+        for (let i: int = 0; i < keys.len(); i++) {
+            if (now - seen[keys[i]] > idle) {
+                dead.push(str.toInt(keys[i]))
+            } else {
+                alive.push(str.toInt(keys[i]))
+            }
+        }
+        mu.unlock()
+        if (ping <= 0) {
+            return
+        }
+        for (let i: int = 0; i < dead.len(); i++) {
+            ws.close(socketOf(dead[i]))
+        }
+        for (let i: int = 0; i < alive.len(); i++) {
+            ws.send(socketOf(alive[i]), "ping")
+        }
+        time.sleep(ping)
+    }
+}
+
+// --- Helpers under the lock --------------------------------------------------------
+
+// The App `serve` was given; the socket's handlers only run after it.
+fn theApp(): App {
+    mu.lock()
+    let a: App = apps[0]
+    mu.unlock()
+    return a
+}
+
+// A server-side socket from its fd: the runtime finds the connection by fd.
+fn socketOf(fd: int): ws.Conn {
+    return ws.Conn { fd: fd, isServer: 1, ssl: 0 }
+}
+
+// The connection on `fd`, or one with an empty id when there is none.
+fn connOf(fd: int): Conn {
+    let key: string = str.fromInt(fd)
+    mu.lock()
+    if (!ids.has(key)) {
+        mu.unlock()
+        return Conn { id: "", user: "", path: "", token: "", fd: fd }
+    }
+    let c: Conn = Conn { id: ids[key], user: users[key], path: paths[key], token: tokens[key], fd: fd }
+    mu.unlock()
+    return c
+}
+
+fn fdOfId(connId: string): int {
+    mu.lock()
+    let fd: int = str.toInt(textAt(fds, connId, "-1"))
+    mu.unlock()
+    return fd
+}
+
+fn familyOf(channel: string): string {
+    mu.lock()
+    let f: string = textAt(families, channel, "")
+    mu.unlock()
+    return f
+}
+
+fn isMember(fd: int, channel: string): bool {
+    mu.lock()
+    let yes: bool = members.has(channel) && members[channel].contains("," + str.fromInt(fd) + ",")
+    mu.unlock()
+    return yes
+}
+
+// Takes `fd` out of `channel`; false if it was not in it.
+fn leave(fd: int, channel: string): bool {
+    let key: string = str.fromInt(fd)
+    mu.lock()
+    if (!members.has(channel) || !members[channel].contains("," + key + ",")) {
+        mu.unlock()
+        return false
+    }
+    dropMember(channel, key)
+    if (joined.has(key)) {
+        joined[key] = joined[key].replace("\n" + channel + "\n", "\n")
+    }
+    mu.unlock()
+    return true
+}
+
+// Under `mu`: removes `key` from `channel`'s members, and forgets an empty channel.
+fn dropMember(channel: string, key: string): void {
+    if (channel.isEmpty() || !members.has(channel)) {
+        return
+    }
+    let rest: string = members[channel].replace("," + key + ",", ",")
+    if (rest == ",") {
+        members.remove(channel)
+        families.remove(channel)
+        return
+    }
+    members[channel] = rest
+}
+
+// m[key], or `otherwise` when it has none. Under `mu`.
+fn textAt(m: map[string, string], key: string, otherwise: string): string {
+    if (m.has(key)) {
+        return m[key]
+    }
+    return otherwise
+}
+
+// The fds in ",3,7,".
+fn fdList(list: string): int[] {
+    let out: int[] = []
+    let parts: string[] = list.split(",")
+    for (let i: int = 0; i < parts.len(); i++) {
+        if (!parts[i].isEmpty()) {
+            out.push(str.toInt(parts[i]))
+        }
+    }
+    return out
+}

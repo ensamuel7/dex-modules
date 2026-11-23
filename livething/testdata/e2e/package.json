@@ -1,0 +1,9 @@
+{
+  "name": "livething-dex-e2e",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@livething/client": "1.0.0-alpha.0",
+    "@livething/core": "1.0.0-alpha.0"
+  }
+}
